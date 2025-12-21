@@ -1,0 +1,7 @@
+selenium
+webdriver-manager
+beautifulsoup4
+gspread
+oauth2client
+tradingview-screener
+pandas
