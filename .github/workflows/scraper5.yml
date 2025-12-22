@@ -1,0 +1,35 @@
+name: TradingView Batch 5 (500-699 | multi-shard)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk:
+          - { id: 5, start: 500, end: 599 }
+          - { id: 6, start: 600, end: 699 }
+        shard: [0, 1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable xvfb
+      - run: pip install gspread selenium beautifulsoup4 webdriver-manager
+      - run: |
+          echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
+          echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+      - run: python run_scraper.py
+        env:
+          START_INDEX: ${{ matrix.chunk.start }}
+          END_INDEX: ${{ matrix.chunk.end }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_STEP: 5
+          CHECKPOINT_FILE: checkpoint_chunk${{ matrix.chunk.id }}_shard${{ matrix.shard }}.txt
