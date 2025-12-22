@@ -1,25 +1,38 @@
-name: TradingView Chunk 0 (0-249)
+name: Parallel TradingView Scraper
+
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 7 * * 2'
+    - cron: '0 0 * * *' # Runs daily at midnight
+  workflow_dispatch: # Allows manual trigger
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    strategy:
+      # This creates 5 parallel instances of your script
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+    
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v4
-      with: { python-version: '3.10' }
-    - run: sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable xvfb
-    - run: pip install gspread selenium beautifulsoup4 webdriver-manager
-    - run: |
-        echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
-        echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
-    - run: python run_scraper.py
-      env:
-        START_INDEX: 0
-        END_INDEX: 249
-        SHARD_INDEX: 0
-        SHARD_STEP: 10
-        CHECKPOINT_FILE: checkpoint_chunk0.txt
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium webdriver-manager beautifulsoup4 gspread google-auth
+
+      - name: Run Scraper Shard
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          # Logic: 750 symbols / 5 shards = 150 symbols per shard
+          # Shard 0: 0-149, Shard 1: 150-299, etc.
+          START_INDEX: ${{ matrix.shard * 150 }}
+          END_INDEX: ${{ (matrix.shard + 1) * 150 - 1 }}
+          CHECKPOINT_FILE: "checkpoint_${{ matrix.shard }}.txt"
+        run: python run_scraper.py
