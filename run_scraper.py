@@ -6,95 +6,91 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import TimeoutException
 from bs4 import BeautifulSoup
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------------- CONFIG (ALIGNED WITH YOUR SHEETS) ---------------- #
-# Using your specific URLs and sheet names
+# ---------------- CONFIG ---------------- #
 STOCK_LIST_URL = "https://docs.google.com/spreadsheets/d/1V8DsH-R3vdUbXqDKZYWHk_8T0VRjqTEVyj7PhlIDtG4/edit?gid=0#gid=0"
 NEW_MV2_URL    = "https://docs.google.com/spreadsheets/d/1GKlzomaK4l_Yh8pzVtzucCogWW5d-ikVeqCxC6gvBuc/edit?gid=0#gid=0"
 
-# Sharding / Checkpoint logic
-SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP = int(os.getenv("SHARD_STEP", "1"))
-checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
-last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
+START_INDEX = int(os.getenv("START_INDEX", "0"))
+END_INDEX   = int(os.getenv("END_INDEX", "2500"))
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint.txt")
 
-# ---------------- OPTIMIZED CHROME SETUP ---------------- #
+last_i = START_INDEX
+if os.path.exists(CHECKPOINT_FILE):
+    try:
+        with open(CHECKPOINT_FILE, "r") as f:
+            last_i = int(f.read().strip())
+    except: pass
+
+# ---------------- GOOGLE SHEETS ---------------- #
+try:
+    creds_json = os.getenv("GSPREAD_CREDENTIALS")
+    client = gspread.service_account_from_dict(json.loads(creds_json)) if creds_json else gspread.service_account(filename="credentials.json")
+    source_sheet = client.open_by_url(STOCK_LIST_URL).worksheet("Sheet1")
+    dest_sheet   = client.open_by_url(NEW_MV2_URL).worksheet("Sheet5")
+    data_rows = source_sheet.get_all_values()[1:]
+    print(f"✅ Sheets Connected.")
+except Exception as e:
+    print(f"❌ Connection Error: {e}"); raise
+
+# ---------------- PERSISTENT BROWSER SETUP ---------------- #
 def get_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-    
-    # SPEED OPTIMIZATION: Block images only (Keep CSS for TradingView data rendering)
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    # SPEED BOOST: Block Images
     prefs = {"profile.managed_default_content_settings.images": 2}
-    chrome_options.add_experimental_option("prefs", prefs)
+    opts.add_experimental_option("prefs", prefs)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
-# ---------------- GOOGLE SHEETS AUTH ---------------- #
-try:
-    creds_json = os.getenv("GSPREAD_CREDENTIALS")
-    if creds_json:
-        gc = gspread.service_account_from_dict(json.loads(creds_json))
-    else:
-        gc = gspread.service_account(filename="credentials.json")
-
-    # Connect to your specific sheets and worksheets
-    sheet_main = gc.open_by_url(STOCK_LIST_URL).worksheet('Sheet1')
-    sheet_data = gc.open_by_url(NEW_MV2_URL).worksheet('Sheet5')
-    
-    # Batch read for speed
-    all_rows = sheet_main.get_all_values()[1:] # Skip header
-    name_list = [row[0] for row in all_rows]
-    url_list = [row[3] if len(row) > 3 else "" for row in all_rows]
-    current_date = date.today().strftime("%m/%d/%Y")
-    print(f"✅ Connected. Processing symbols starting from index {last_i}")
-except Exception as e:
-    print(f"❌ Connection Error: {e}")
-    exit(1)
-
 # ---------------- SCRAPER LOGIC ---------------- #
-def scrape_tradingview(driver, url):
-    try:
-        driver.get(url)
-        # Wait for your specific data container to appear
-        WebDriverWait(driver, 45).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "valueValue-l31H9iuA"))
-        )
-        time.sleep(2) # Brief jitter to let JS finish numbers
-        
+def extract_values(driver):
+    all_values = []
+    # Strategy 1: CSS Selectors
+    selectors = [".valueValue-l31H9iuA.apply-common-tooltip", ".valueValue-l31H9iuA"]
+    for selector in selectors:
+        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+        for el in elements[:20]:
+            val = el.text.strip().replace('−', '-').replace('∅', '')
+            if val and len(val) < 25: all_values.append(val)
+    
+    # Strategy 2: Table Fallback
+    if len(all_values) < 14:
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        # Your exact BeautifulSoup class and cleaning logic
-        values = [
-            el.get_text().replace('−', '-').replace('∅', 'None').strip()
-            for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
-        ]
-        
-        # Standardize to 14 columns
-        final_vals = values[:14]
-        while len(final_vals) < 14:
-            final_vals.append("N/A")
-        return final_vals
-        
-    except Exception as e:
-        print(f"  ⚠️ Error: {e}")
-        return ["N/A"] * 14
+        for cell in soup.find_all(['td', 'div'], string=re.compile(r'[\d,.-]+'))[:20]:
+            text = cell.get_text().strip().replace('−', '-')
+            if text not in all_values and len(text) < 25: all_values.append(text)
+    
+    # Unique and Pad
+    unique = []
+    for v in all_values:
+        if v not in unique: unique.append(v)
+    
+    final = unique[:14]
+    while len(final) < 14: final.append("N/A")
+    return final
 
 # ---------------- MAIN LOOP ---------------- #
+current_date = date.today().strftime("%m/%d/%Y")
 driver = get_driver()
-buffer = []
-BATCH_SIZE = 10 # Optimized batch for GitHub Actions performance
+batch, batch_start = [], None
+processed = success_count = 0
 
 try:
-    # Load Cookies (Persistent for the whole run)
+    # Initial Cookie Load
     if os.path.exists("cookies.json"):
         driver.get("https://www.tradingview.com/")
         with open("cookies.json", "r") as f:
@@ -103,33 +99,39 @@ try:
                 except: pass
         driver.refresh()
 
-    for i in range(last_i, len(url_list)):
-        # Sharding check
-        if i % SHARD_STEP != SHARD_INDEX:
-            continue
+    for i, row in enumerate(data_rows):
+        if i < last_i or i < START_INDEX or i > END_INDEX: continue
         
-        if i >= 2500: break # Hard stop for safety
+        name, url = row[0].strip(), (row[3] if len(row) > 3 else "")
+        target_row = i + 2
+        if batch_start is None: batch_start = target_row
 
-        name = name_list[i]
-        url = url_list[i]
-        print(f"🔎 [{i}] {name}")
+        print(f"🔎 [{i+1}] {name[:20]}")
 
-        row_data = [name, current_date] + scrape_tradingview(driver, url)
-        buffer.append(row_data)
+        try:
+            driver.get(url)
+            # Smart wait for any value to appear
+            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CLASS_NAME, "valueValue-l31H9iuA")))
+            time.sleep(1.5) # Brief jitter for numbers to settle
+            
+            vals = extract_values(driver)
+            if any(v != "N/A" for v in vals): success_count += 1
+            batch.append([name, current_date] + vals)
+        except Exception as e:
+            print(f"  ⚠️ Error: {e}")
+            batch.append([name, current_date] + ["N/A"] * 14)
 
-        # Write to Sheet5 in batches
-        if len(buffer) >= BATCH_SIZE:
-            sheet_data.append_rows(buffer, value_input_option='USER_ENTERED')
-            print(f"💾 Saved {len(buffer)} rows. Index: {i}")
-            buffer.clear()
-            # Save Checkpoint
-            with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-        
-        # Small jitter delay (Your proven logic)
-        time.sleep(1.5 + random.random())
+        processed += 1
+
+        # Batch write every 10 rows for speed
+        if len(batch) >= 10:
+            dest_sheet.update(f"A{batch_start}", batch)
+            print(f"💾 Rows {batch_start}-{target_row} saved.")
+            with open(CHECKPOINT_FILE, "w") as f: f.write(str(i + 1))
+            batch, batch_start = [], None
+            time.sleep(1)
 
 finally:
-    if buffer:
-        sheet_data.append_rows(buffer, value_input_option='USER_ENTERED')
+    if batch: dest_sheet.update(f"A{batch_start}", batch)
     driver.quit()
-    print("All done ✅")
+    print(f"\n🏁 FINISHED. Success: {success_count}/{processed}")
