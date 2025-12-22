@@ -1,52 +1,42 @@
-name: Parallel TradingView Scraper
+name: TradingView Batch 1 (0-199 | multi-shard)
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 2'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     strategy:
-      fail-fast: false # Ensures one shard failing doesn't stop the others
+      fail-fast: false
       matrix:
-        # We explicitly define the start/end for each shard to avoid YAML math errors
-        include:
-          - shard: 0
-            start: 0
-            end: 149
-          - shard: 1
-            start: 150
-            end: 299
-          - shard: 2
-            start: 300
-            end: 449
-          - shard: 3
-            start: 450
-            end: 599
-          - shard: 4
-            start: 600
-            end: 749
+        chunk:
+          - { id: 0, start: 0,   end: 99 }
+          - { id: 1, start: 100, end: 199 }
+        shard: [0, 1, 2, 3, 4]   # 5 shards per chunk
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install selenium webdriver-manager beautifulsoup4 gspread google-auth
+      - run: sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable xvfb
 
-      - name: Run Scraper Shard
+      - run: pip install gspread selenium beautifulsoup4 webdriver-manager
+
+      - run: |
+          echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
+          echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+
+      - run: python run_scraper.py
         env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          START_INDEX: ${{ matrix.start }}
-          END_INDEX: ${{ matrix.end }}
-          CHECKPOINT_FILE: "checkpoint_${{ matrix.shard }}.txt"
-        run: python run_scraper.py
+          START_INDEX: ${{ matrix.chunk.start }}
+          END_INDEX: ${{ matrix.chunk.end }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_STEP: 5
+          CHECKPOINT_FILE: checkpoint_chunk${{ matrix.chunk.id }}_shard${{ matrix.shard }}.txt
