@@ -1,3 +1,5 @@
+import os, time, json, gspread, re, random
+from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -6,178 +8,128 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from bs4 import BeautifulSoup
-import gspread
-from datetime import date
-import os
-import time
-import json
-import random
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------------- SHARDING ---------------- #
+# ---------------- CONFIG (ALIGNED WITH YOUR SHEETS) ---------------- #
+# Using your specific URLs and sheet names
+STOCK_LIST_URL = "https://docs.google.com/spreadsheets/d/1V8DsH-R3vdUbXqDKZYWHk_8T0VRjqTEVyj7PhlIDtG4/edit?gid=0#gid=0"
+NEW_MV2_URL    = "https://docs.google.com/spreadsheets/d/1GKlzomaK4l_Yh8pzVtzucCogWW5d-ikVeqCxC6gvBuc/edit?gid=0#gid=0"
+
+# Sharding / Checkpoint logic
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
-last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 1
+last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
 
-# ---------------- CHROME SETUP ---------------- #
-chrome_options = Options()
-chrome_options.add_argument("--headless=new")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--remote-debugging-port=9222")
-chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
+# ---------------- OPTIMIZED CHROME SETUP ---------------- #
+def get_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+    
+    # SPEED OPTIMIZATION: Block images only (Keep CSS for TradingView data rendering)
+    prefs = {"profile.managed_default_content_settings.images": 2}
+    chrome_options.add_experimental_option("prefs", prefs)
+    
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return driver
 
 # ---------------- GOOGLE SHEETS AUTH ---------------- #
 try:
-    gc = gspread.service_account("credentials.json")
+    creds_json = os.getenv("GSPREAD_CREDENTIALS")
+    if creds_json:
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+    else:
+        gc = gspread.service_account(filename="credentials.json")
+
+    # Connect to your specific sheets and worksheets
+    sheet_main = gc.open_by_url(STOCK_LIST_URL).worksheet('Sheet1')
+    sheet_data = gc.open_by_url(NEW_MV2_URL).worksheet('Sheet5')
+    
+    # Batch read for speed
+    all_rows = sheet_main.get_all_values()[1:] # Skip header
+    name_list = [row[0] for row in all_rows]
+    url_list = [row[3] if len(row) > 3 else "" for row in all_rows]
+    current_date = date.today().strftime("%m/%d/%Y")
+    print(f"✅ Connected. Processing symbols starting from index {last_i}")
 except Exception as e:
-    print(f"Error loading credentials.json: {e}")
+    print(f"❌ Connection Error: {e}")
     exit(1)
 
-sheet_main = gc.open('Stock List').worksheet('Sheet1')
-sheet_data = gc.open('New MV2').worksheet('Sheet5')
-
-# Batch read once
-company_list = sheet_main.col_values(5)
-name_list = sheet_main.col_values(1)
-current_date = date.today().strftime("%m/%d/%Y")
-
-# ---------------- CUSTOM EXPECTED CONDITION ---------------- #
-# This class waits until at least 'min_count' elements of the given class
-# have non-empty text content, ensuring the data is fully rendered.
-class text_content_loaded:
-    """An expectation for checking that text content has loaded."""
-    def __init__(self, locator, min_count=1):
-        self.locator = locator
-        self.min_count = min_count
-
-    def __call__(self, driver):
-        elements = driver.find_elements(*self.locator)
-        non_empty_count = 0
-        if len(elements) > 0:
-            for el in elements:
-                if el.text.strip():
-                    non_empty_count += 1
-            # Return elements if enough have non-empty text, otherwise return False
-            if non_empty_count >= self.min_count:
-                return elements
-        return False
-        
-# ---------------- SCRAPER ---------------- #
-# --- UPDATED: Using Custom Expected Condition to wait for data content ---
-def scrape_tradingview(driver, company_url):
-    DATA_LOCATOR = (By.CLASS_NAME, "valueValue-l31H9iuA") 
-    
+# ---------------- SCRAPER LOGIC ---------------- #
+def scrape_tradingview(driver, url):
     try:
-        driver.get(company_url)
-        
-        # We wait up to 75 seconds for at least 10 data elements to be visible AND contain text.
-        # Note: We use the shorter class name for robust element locating.
-        WebDriverWait(driver, 75).until(
-            text_content_loaded(DATA_LOCATOR, min_count=10) 
+        driver.get(url)
+        # Wait for your specific data container to appear
+        WebDriverWait(driver, 45).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "valueValue-l31H9iuA"))
         )
+        time.sleep(2) # Brief jitter to let JS finish numbers
         
-        # After the wait succeeds, the page is fully loaded with content.
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        
-        # Re-using your original BeautifulSoup logic to scrape the text
+        # Your exact BeautifulSoup class and cleaning logic
         values = [
-            el.get_text().replace('−', '-').replace('∅', 'None')
-            # The class below is for the data values that we want to extract
+            el.get_text().replace('−', '-').replace('∅', 'None').strip()
             for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
         ]
         
-        if not values:
-            print(f"⚠️ Scraping successful but BeautifulSoup found no data for {company_url}.")
-            
-        return values
+        # Standardize to 14 columns
+        final_vals = values[:14]
+        while len(final_vals) < 14:
+            final_vals.append("N/A")
+        return final_vals
         
-    except (NoSuchElementException, TimeoutException):
-        print(f"⚠️ Scraping failed (Timeout or Element Not Found) for {company_url}.")
-        return []
     except Exception as e:
-        print(f"🚨 Unexpected error scraping {company_url}: {e}")
-        return []
+        print(f"  ⚠️ Error: {e}")
+        return ["N/A"] * 14
 
 # ---------------- MAIN LOOP ---------------- #
-# Initialize the driver once
-try:
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-except Exception as e:
-    print(f"Error initializing WebDriver: {e}")
-    exit(1)
-
-
-# Load cookies (once per shard)
-if os.path.exists("cookies.json"):
-    driver.get("https://www.tradingview.com/")
-    with open("cookies.json", "r", encoding="utf-8") as f:
-        cookies = json.load(f)
-    for cookie in cookies:
-        try:
-            cookie_to_add = {k: cookie[k] for k in ('name', 'value', 'domain', 'path') if k in cookie}
-            cookie_to_add['secure'] = cookie.get('secure', False)
-            cookie_to_add['httpOnly'] = cookie.get('httpOnly', False)
-            if 'expiry' in cookie and cookie['expiry'] not in [None, '']:
-                 cookie_to_add['expiry'] = int(cookie['expiry'])
-            
-            driver.add_cookie(cookie_to_add)
-        except Exception:
-            pass
-    driver.refresh()
-    time.sleep(2)
-else:
-    print("⚠️ cookies.json not found, scraping without login. Login may be required for full data access.")
-
+driver = get_driver()
 buffer = []
-BATCH_SIZE = 50
+BATCH_SIZE = 10 # Optimized batch for GitHub Actions performance
 
-# Start loop from the last successful checkpoint
-for i, company_url in enumerate(company_list[last_i:], last_i):
-    if i % SHARD_STEP != SHARD_INDEX:
-        continue
-    
-    # We aim for 2235, setting a generous hard stop at 2500
-    if i > 2500: 
-         print("Reached scraping limit of 2500. Stopping.")
-         break
+try:
+    # Load Cookies (Persistent for the whole run)
+    if os.path.exists("cookies.json"):
+        driver.get("https://www.tradingview.com/")
+        with open("cookies.json", "r") as f:
+            for c in json.load(f):
+                try: driver.add_cookie(c)
+                except: pass
+        driver.refresh()
 
-    name = name_list[i] if i < len(name_list) else f"Row {i}"
-    print(f"Scraping {i}: {name}")
+    for i in range(last_i, len(url_list)):
+        # Sharding check
+        if i % SHARD_STEP != SHARD_INDEX:
+            continue
+        
+        if i >= 2500: break # Hard stop for safety
 
-    values = scrape_tradingview(driver, company_url)
-    if values:
-        buffer.append([name, current_date] + values)
-    else:
-        print(f"Skipping {name}: no data")
+        name = name_list[i]
+        url = url_list[i]
+        print(f"🔎 [{i}] {name}")
 
-    # Write checkpoint
-    with open(checkpoint_file, "w") as f:
-        f.write(str(i))
+        row_data = [name, current_date] + scrape_tradingview(driver, url)
+        buffer.append(row_data)
 
-    # Write every 50 rows
-    if len(buffer) >= BATCH_SIZE:
-        try:
-            sheet_data.append_rows(buffer, table_range='A1') 
-            print(f"✅ Wrote batch of {len(buffer)} rows. Current row index: {i}")
+        # Write to Sheet5 in batches
+        if len(buffer) >= BATCH_SIZE:
+            sheet_data.append_rows(buffer, value_input_option='USER_ENTERED')
+            print(f"💾 Saved {len(buffer)} rows. Index: {i}")
             buffer.clear()
-        except Exception as e:
-            print(f"⚠️ Batch write failed: {e}. Data remaining in buffer.")
+            # Save Checkpoint
+            with open(checkpoint_file, "w") as f: f.write(str(i + 1))
+        
+        # Small jitter delay (Your proven logic)
+        time.sleep(1.5 + random.random())
 
-    # Sleep with jitter (1.5s to 3.0s) for rate limit avoidance
-    sleep_time = 1.5 + random.random() * 1.5 
-    time.sleep(sleep_time)
-
-# Final flush of any remaining items in the buffer
-if buffer:
-    try:
-        sheet_data.append_rows(buffer, table_range='A1')
-        print(f"✅ Final batch of {len(buffer)} rows written.")
-    except Exception as e:
-        print(f"⚠️ Final write failed: {e}")
-
-driver.quit()
-print("All done ✅")
+finally:
+    if buffer:
+        sheet_data.append_rows(buffer, value_input_option='USER_ENTERED')
+    driver.quit()
+    print("All done ✅")
