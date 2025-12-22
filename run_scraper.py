@@ -38,7 +38,7 @@ except Exception as e:
     exit(1)
 
 sheet_main = gc.open('Stock List').worksheet('Sheet1')
-sheet_data = gc.open('Tradingview Data Reel Experimental May').worksheet('Sheet5')
+sheet_data = gc.open('New MV2').worksheet('Sheet5')
 
 # Batch read once
 company_list = sheet_main.col_values(5)
