@@ -17,7 +17,6 @@ START_INDEX = int(os.getenv("START_INDEX", "0"))
 END_INDEX   = int(os.getenv("END_INDEX", "2500"))
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint.txt")
 
-# Resume Logic
 last_i = START_INDEX
 if os.path.exists(CHECKPOINT_FILE):
     try:
@@ -25,7 +24,7 @@ if os.path.exists(CHECKPOINT_FILE):
             last_i = int(f.read().strip())
     except: pass
 
-# ---------------- OPTIMIZED BROWSER INIT ---------------- #
+# ---------------- BROWSER INIT (FIXED) ---------------- #
 def get_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -38,8 +37,8 @@ def get_driver():
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
     
-    # SPEED BOOST: Disable images and unnecessary CSS rendering
-    prefs = {"profile.managed_default_content_settings.images": 2, "profile.managed_default_content_settings.stylesheets": 2}
+    # ONLY block images. Do NOT block CSS (stylesheets), otherwise data stays hidden.
+    prefs = {"profile.managed_default_content_settings.images": 2}
     opts.add_experimental_option("prefs", prefs)
 
     service = Service(ChromeDriverManager().install())
@@ -54,7 +53,6 @@ try:
     source_sheet = client.open_by_url(STOCK_LIST_URL).worksheet("Sheet1")
     dest_sheet   = client.open_by_url(NEW_MV2_URL).worksheet("Sheet5")
     data_rows = source_sheet.get_all_values()[1:]
-    print("✅ Sheets Connected")
 except Exception as e:
     print(f"❌ Connection Error: {e}"); raise
 
@@ -64,7 +62,6 @@ batch, batch_start = [], None
 
 # ---------------- SCRAPING LOOP ---------------- #
 try:
-    # Initial Cookie Load (Done once per run)
     if os.path.exists("cookies.json"):
         driver.get("https://www.tradingview.com/")
         with open("cookies.json", "r") as f:
@@ -72,6 +69,7 @@ try:
                 try: driver.add_cookie(c)
                 except: pass
         driver.refresh()
+        time.sleep(2)
 
     for i, row in enumerate(data_rows):
         if i < last_i or i < START_INDEX or i > END_INDEX:
@@ -82,37 +80,38 @@ try:
         target_row = i + 2
         if batch_start is None: batch_start = target_row
 
-        print(f"🔎 [{i+1}] Processing: {name}")
+        print(f"🔎 [{i+1}] {name}")
 
         try:
             driver.get(url)
             
-            # YOUR EXACT XPATH & WAIT LOGIC
-            WebDriverWait(driver, 25).until(
-                EC.visibility_of_element_located((By.XPATH, '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'))
+            # YOUR EXACT XPATH - increased wait to ensure it renders
+            WebDriverWait(driver, 35).until(
+                EC.presence_of_element_located((By.XPATH, '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'))
             )
-            
-            # YOUR EXACT BS4 & SELECTOR LOGIC
+            time.sleep(2) # Short pause for JS to populate values
+
+            # YOUR EXACT BS4 LOGIC
             soup = BeautifulSoup(driver.page_source, "html.parser")
+            found_elements = soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+            
             found_vals = [
                 el.get_text().replace('−', '-').replace('∅', '').strip()
-                for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+                for el in found_elements
             ]
             
-            # Pad to 14 columns as per your new requirement
             vals = found_vals[:14]
             while len(vals) < 14: vals.append("N/A")
 
         except Exception as e:
-            print(f"  ⚠️ Skip {name}: {e}")
+            print(f"  ⚠️ Error: {e}")
             vals = ["N/A"] * 14
 
         batch.append([name, current_date] + vals)
 
-        # Batch Write (Optimized to 10 rows for API speed)
-        if len(batch) >= 10:
+        if len(batch) >= 5:
             dest_sheet.update(f"A{batch_start}", batch)
-            print(f"💾 Saved Rows {batch_start}-{target_row}")
+            print(f"💾 Saved Rows {batch_start} to {target_row}")
             with open(CHECKPOINT_FILE, "w") as f: f.write(str(i + 1))
             batch, batch_start = [], None
             time.sleep(1)
@@ -121,4 +120,3 @@ finally:
     if batch:
         dest_sheet.update(f"A{batch_start}", batch)
     driver.quit()
-    print("🏁 Process Finished.")
