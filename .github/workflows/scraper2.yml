@@ -1,4 +1,4 @@
-name: TradingView Batch 2 (200-299 | multi-shard)
+name: TradingView Batch 05 (800-999 | multi-shard)
 
 on:
   workflow_dispatch:
@@ -7,19 +7,18 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     strategy:
       fail-fast: false
       matrix:
         chunk:
-          - { id: 2, start: 200, end: 299 }
+          - { id: 8, start: 800, end: 899 }
+          - { id: 9, start: 900, end: 999 }
         shard: [0, 1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+        with: { python-version: '3.10' }
       - run: sudo apt-get update -qq && sudo apt-get install -y google-chrome-stable xvfb
       - run: pip install gspread selenium beautifulsoup4 webdriver-manager
       - run: |
@@ -31,4 +30,4 @@ jobs:
           END_INDEX: ${{ matrix.chunk.end }}
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_STEP: 5
-          CHECKPOINT_FILE: checkpoint_chunk2_shard${{ matrix.shard }}.txt
+          CHECKPOINT_FILE: checkpoint_chunk${{ matrix.chunk.id }}_shard${{ matrix.shard }}.txt
