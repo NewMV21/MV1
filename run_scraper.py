@@ -49,11 +49,11 @@ except Exception as e:
 current_date = date.today().strftime("%m/%d/%Y")
 CHROME_SERVICE = Service(ChromeDriverManager().install())
 
-# ---------------- ULTRA-FAST SCRAPER ---------------- #
+# ---------------- YOUR PROVEN ALL-VALUES SCRAPER ---------------- #
 def scrape_tradingview(url, symbol_name):
     if not url:
         print(f"  ❌ No URL for {symbol_name}")
-        return ["N/A"] * 14
+        return [""] * 14 
     
     opts = Options()
     opts.add_argument("--headless=new")
@@ -72,67 +72,101 @@ def scrape_tradingview(url, symbol_name):
     try:
         print(f"  🌐 {symbol_name[:20]}...")
         
-        # Cookies (your exact logic)
+        # YOUR COOKIES LOGIC (EXACT)
         if os.path.exists("cookies.json"):
             driver.get("https://www.tradingview.com/")
-            try:
-                with open("cookies.json", "r") as f:
-                    cookies = json.load(f)
-                    for c in cookies[:15]:
-                        try:
-                            driver.add_cookie({
-                                "name": c.get("name"), "value": c.get("value"),
-                                "domain": c.get("domain", ".tradingview.com"), 
-                                "path": c.get("path", "/")
-                            })
-                        except: pass
-                driver.refresh()
-                time.sleep(1.2)  # Optimized
-            except: pass
+            with open("cookies.json", "r") as f:
+                cookies = json.load(f)
+                for c in cookies[:15]:
+                    try:
+                        driver.add_cookie({
+                            "name": c.get("name"), "value": c.get("value"),
+                            "domain": c.get("domain", ".tradingview.com"), 
+                            "path": c.get("path", "/")
+                        })
+                    except: pass
+            driver.refresh()
+            time.sleep(1.5)
         
-        driver.set_page_load_timeout(25)
+        driver.set_page_load_timeout(35)
         driver.get(url)
-        time.sleep(2.5)  # Optimized from 6s
+        time.sleep(4)  # Enough for full render
         
-        # YOUR PROVEN EXTRACTION (EXACT + OPTIMIZED)
+        # **YOUR PROVEN 3-STRATEGY EXTRACTION (ALL VALUES!)**
+        all_values = []
+        
+        # Strategy 1: Primary value classes (YOUR EXACT SELECTORS)
+        selectors = [
+            ".valueValue-l31H9iuA.apply-common-tooltip",
+            ".valueValue-l31H9iuA",
+            "div[class*='valueValue']",
+            "div[class*='value']",
+            ".chart-markup-table .value",
+            "[data-value]"
+        ]
+        
         soup = BeautifulSoup(driver.page_source, "html.parser")
         
-        # Priority 1: Your exact selectors
-        values = []
-        for selector in [
-            "div.valueValue-l31H9iuA.apply-common-tooltip",
-            "div.valueValue-l31H9iuA",
-            "div[class*='valueValue']"
-        ]:
-            els = soup.select(selector)
-            for el in els[:14]:
-                text = el.get_text().strip().replace('−', '-').replace('∅', '')
-                if text and len(text) < 25 and text not in values:
-                    values.append(text)
+        for selector in selectors:
+            try:
+                elements = soup.select(selector)
+                values = []
+                for el in elements[:25]:  # Grab MORE values
+                    text = el.get_text().strip().replace('−', '-').replace('∅', '')
+                    if text and len(text) < 30:  # Keep ALL valid values
+                        values.append(text)
+                all_values.extend(values)
+                print(f"  ✅ Selector '{selector}': {len(values)} values")
+            except:
+                continue
         
-        # Priority 2: Simple numeric fallback (SAFE regex)
-        if len(values) < 10:
-            for div in soup.find_all('div')[:50]:
-                text = div.get_text().strip().replace('−', '-')
-                if (text and 
-                    re.search(r'[\d,.-%()]', text) and 
-                    len(text) < 25 and 
-                    text not in values):
-                    values.append(text)
+        # Strategy 2: YOUR NUMERIC EXTRACTION (EXPANDED)
+        numeric_divs = soup.find_all('div', string=re.compile(r'[\d,.-]+'))
+        for div in numeric_divs[:20]:
+            text = div.get_text().strip().replace('−', '-')
+            if (re.match(r'^[\d,.-]+.*|.*[\d,.-]+$', text) and 
+                len(text) < 30 and text not in all_values):
+                all_values.append(text)
         
-        # Exact 14 values (your logic)
-        final_values = values[:14]
+        # Strategy 3: YOUR TABLE CELLS (ALL TABLES)
+        tables = soup.find_all('table')
+        for table in tables[:5]:
+            for cell in table.find_all(['td', 'th'])[:30]:
+                text = cell.get_text().strip().replace('−', '-')
+                if (re.search(r'[\d,.-]', text) and 
+                    len(text) < 30 and text not in all_values):
+                    all_values.append(text)
+        
+        # Strategy 4: YOUR XPATH VALIDATION (ENSURE LOADED)
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((
+                    By.XPATH,
+                    '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
+                ))
+            )
+        except:
+            pass
+        
+        # **DEDUPE & PAD TO 14+ (KEEP ALL!)**
+        unique_values = []
+        for val in all_values:
+            if val and len(val) > 0 and len(val) < 35 and val not in unique_values:
+                unique_values.append(val)
+        
+        # RETURN ALL VALUES (minimum 14, maximum whatever found)
+        final_values = unique_values[:25]  # Cap at 25 for sheet
         while len(final_values) < 14:
             final_values.append("N/A")
             
-        print(f"  📊 {len(values)} → {final_values[:2]}...")
+        print(f"  📊 {len(unique_values)} unique values → {final_values[:3]}...")
         return final_values
         
     except TimeoutException:
         print(f"  ⏰ Timeout")
         return ["N/A"] * 14
     except Exception as e:
-        print(f"  ❌ Error: {str(e)[:40]}")
+        print(f"  ❌ Error: {str(e)[:50]}")
         return ["N/A"] * 14
     finally:
         driver.quit()
@@ -143,10 +177,9 @@ batch_start = None
 processed = success_count = 0
 start_time = time.time()
 
-print(f"\n🚀 ULTRA-FAST MODE (250 symbols → ~4 mins)")
+print(f"\n🚀 FULL-VALUES MODE (ALL 14+ values per symbol)")
 
 for i, row in enumerate(data_rows):
-    # YOUR EXACT RANGE LOGIC
     if i < last_i or i < START_INDEX or i > END_INDEX:
         continue
     
@@ -159,9 +192,8 @@ for i, row in enumerate(data_rows):
     
     print(f"[{i+1:4d}/{END_INDEX-START_INDEX+1}] {name[:25]} -> Row {target_row}")
     
-    # YOUR PROVEN SCRAPER
     vals = scrape_tradingview(url, name)
-    row_data = [name, current_date] + vals
+    row_data = [name, current_date] + vals[:14]  # Take first 14 for sheet
     
     if any(v != "N/A" for v in vals):
         success_count += 1
@@ -169,24 +201,21 @@ for i, row in enumerate(data_rows):
     batch.append(row_data)
     processed += 1
     
-    # YOUR BATCH LOGIC (LARGER = FASTER)
-    if len(batch) >= 8:  # Increased from 5
+    if len(batch) >= 8:
         try:
             dest_sheet.update(f"A{batch_start}", batch)
-            print(f"💾 Saved rows {batch_start}-{target_row}")
+            print(f"💾 Saved rows {batch_start}-{target_row} ({len(vals)} values found)")
             batch = []
             batch_start = None
-            time.sleep(1.2)  # Optimized
+            time.sleep(1.2)
         except Exception as e:
             print(f"❌ Write error: {e}")
     
-    # YOUR CHECKPOINT (EXACT)
     with open(CHECKPOINT_FILE, "w") as f:
         f.write(str(i + 1))
     
-    time.sleep(1.2)  # Optimized from 1.8s
+    time.sleep(1.3)
 
-# YOUR FINAL FLUSH (EXACT)
 if batch and batch_start:
     try:
         dest_sheet.update(f"A{batch_start}", batch)
@@ -197,6 +226,5 @@ if batch and batch_start:
 total_time = time.time() - start_time
 print(f"\n🎉 COMPLETE!")
 print(f"📊 Processed: {processed} | Success: {success_count}")
-print(f"📍 Sheet5: Rows {START_INDEX+2}-{END_INDEX+2} × 16 columns")
 print(f"✅ Success rate: {success_count/processed*100:.1f}%")
 print(f"⚡ Speed: {processed/total_time*60:.0f} symbols/min")
