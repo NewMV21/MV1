@@ -2,17 +2,33 @@ name: Parallel TradingView Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs daily at midnight
-  workflow_dispatch: # Allows manual trigger
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     strategy:
-      # This creates 5 parallel instances of your script
+      fail-fast: false # Ensures one shard failing doesn't stop the others
       matrix:
-        shard: [0, 1, 2, 3, 4]
-    
+        # We explicitly define the start/end for each shard to avoid YAML math errors
+        include:
+          - shard: 0
+            start: 0
+            end: 149
+          - shard: 1
+            start: 150
+            end: 299
+          - shard: 2
+            start: 300
+            end: 449
+          - shard: 3
+            start: 450
+            end: 599
+          - shard: 4
+            start: 600
+            end: 749
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -30,9 +46,7 @@ jobs:
       - name: Run Scraper Shard
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          # Logic: 750 symbols / 5 shards = 150 symbols per shard
-          # Shard 0: 0-149, Shard 1: 150-299, etc.
-          START_INDEX: ${{ matrix.shard * 150 }}
-          END_INDEX: ${{ (matrix.shard + 1) * 150 - 1 }}
+          START_INDEX: ${{ matrix.start }}
+          END_INDEX: ${{ matrix.end }}
           CHECKPOINT_FILE: "checkpoint_${{ matrix.shard }}.txt"
         run: python run_scraper.py
