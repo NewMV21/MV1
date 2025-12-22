@@ -25,90 +25,94 @@ if os.path.exists(CHECKPOINT_FILE):
             last_i = int(f.read().strip())
     except: pass
 
-# ---------------- HIGH-SPEED BROWSER SETUP ---------------- #
-def get_optimized_driver():
+# ---------------- OPTIMIZED BROWSER INIT ---------------- #
+def get_driver():
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1200,800")
-    
-    # ⚡ SPEED OPTIMIZATION: Block Images and CSS
-    prefs = {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.managed_default_content_settings.stylesheets": 2,
-        "profile.default_content_setting_values.notifications": 2
-    }
-    opts.add_experimental_option("prefs", prefs)
-    opts.add_argument("--blink-settings=imagesEnabled=false")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
     
+    # SPEED BOOST: Disable images and unnecessary CSS rendering
+    prefs = {"profile.managed_default_content_settings.images": 2, "profile.managed_default_content_settings.stylesheets": 2}
+    opts.add_experimental_option("prefs", prefs)
+
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
-# ---------------- DATA EXTRACTION ---------------- #
-def extract_14_values(driver):
-    try:
-        # Wait for the main technical value container (max 10s)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "valueValue-l31H9iuA"))
-        )
-        
-        # Fast extraction using JS to avoid Python overhead
-        vals = driver.execute_script("""
-            return Array.from(document.querySelectorAll('.valueValue-l31H9iuA')).slice(0, 14).map(el => el.innerText);
-        """)
-        
-        # Clean values
-        cleaned = [v.replace('−', '-').replace('∅', '').strip() for v in vals if v]
-        
-        # Pad to 14
-        while len(cleaned) < 14:
-            cleaned.append("N/A")
-        return cleaned[:14]
-    except:
-        return ["N/A"] * 14
-
-# ---------------- MAIN EXECUTION ---------------- #
+# ---------------- GOOGLE SHEETS AUTH ---------------- #
 try:
-    # Auth
     creds_json = os.getenv("GSPREAD_CREDENTIALS")
     client = gspread.service_account_from_dict(json.loads(creds_json)) if creds_json else gspread.service_account(filename="credentials.json")
-    
     source_sheet = client.open_by_url(STOCK_LIST_URL).worksheet("Sheet1")
     dest_sheet   = client.open_by_url(NEW_MV2_URL).worksheet("Sheet5")
     data_rows = source_sheet.get_all_values()[1:]
-    
-    current_date = date.today().strftime("%m/%d/%Y")
-    driver = get_optimized_driver()
-    batch, batch_start = [], None
-    
-    print(f"🚀 Starting Optimized Scrape: {last_i} to {END_INDEX}")
+    print("✅ Sheets Connected")
+except Exception as e:
+    print(f"❌ Connection Error: {e}"); raise
+
+current_date = date.today().strftime("%m/%d/%Y")
+driver = get_driver()
+batch, batch_start = [], None
+
+# ---------------- SCRAPING LOOP ---------------- #
+try:
+    # Initial Cookie Load (Done once per run)
+    if os.path.exists("cookies.json"):
+        driver.get("https://www.tradingview.com/")
+        with open("cookies.json", "r") as f:
+            for c in json.load(f):
+                try: driver.add_cookie(c)
+                except: pass
+        driver.refresh()
 
     for i, row in enumerate(data_rows):
         if i < last_i or i < START_INDEX or i > END_INDEX:
             continue
-            
+        
         name = row[0]
         url = row[3] if len(row) > 3 else ""
         target_row = i + 2
         if batch_start is None: batch_start = target_row
 
-        print(f"🔎 [{i+1}] {name}")
-        
-        driver.get(url)
-        # Give JS a tiny moment to settle (TradingView is dynamic)
-        time.sleep(1.5) 
-        
-        vals = extract_14_values(driver)
+        print(f"🔎 [{i+1}] Processing: {name}")
+
+        try:
+            driver.get(url)
+            
+            # YOUR EXACT XPATH & WAIT LOGIC
+            WebDriverWait(driver, 25).until(
+                EC.visibility_of_element_located((By.XPATH, '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'))
+            )
+            
+            # YOUR EXACT BS4 & SELECTOR LOGIC
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            found_vals = [
+                el.get_text().replace('−', '-').replace('∅', '').strip()
+                for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+            ]
+            
+            # Pad to 14 columns as per your new requirement
+            vals = found_vals[:14]
+            while len(vals) < 14: vals.append("N/A")
+
+        except Exception as e:
+            print(f"  ⚠️ Skip {name}: {e}")
+            vals = ["N/A"] * 14
+
         batch.append([name, current_date] + vals)
 
-        # Write every 10 rows (Efficient for Google Sheets API)
+        # Batch Write (Optimized to 10 rows for API speed)
         if len(batch) >= 10:
             dest_sheet.update(f"A{batch_start}", batch)
-            print(f"💾 Checkpoint Saved: Row {target_row}")
+            print(f"💾 Saved Rows {batch_start}-{target_row}")
             with open(CHECKPOINT_FILE, "w") as f: f.write(str(i + 1))
             batch, batch_start = [], None
             time.sleep(1)
@@ -116,6 +120,5 @@ try:
 finally:
     if batch:
         dest_sheet.update(f"A{batch_start}", batch)
-    if 'driver' in locals():
-        driver.quit()
-    print("🏁 Process Complete.")
+    driver.quit()
+    print("🏁 Process Finished.")
