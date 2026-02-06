@@ -1,4 +1,4 @@
-import os, time, json, gspread, concurrent.futures, re
+import os, time, json, gspread, concurrent.futures, re, socket
 import pandas as pd
 import mysql.connector
 from mysql.connector import pooling
@@ -21,6 +21,9 @@ DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet15"
 DATE_COL_LETTER = "Z"
 DATE_SYMBOL_COL = "A"
+
+# ✅ target table
+TARGET_TABLE = "nextbaggernew"  # IMPORTANT
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 
@@ -46,7 +49,7 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD"),
     "database": os.getenv("DB_NAME"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "connect_timeout": 30
+    "connect_timeout": 15,
 }
 
 db_pool = None
@@ -61,7 +64,7 @@ DATE_MAP = {}  # symbol -> yyyy-mm-dd
 def log(msg):
     print(msg, flush=True)
 
-def safe_str(e, n=220):
+def safe_str(e, n=260):
     try:
         return str(e).replace("\n", " ")[:n]
     except:
@@ -80,7 +83,6 @@ def normalize_date(val: str) -> str:
         return ""
     s = str(val).strip()
     s = re.sub(r"[^\d/\-]", "", s)
-
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
@@ -139,22 +141,53 @@ def load_date_map(gc):
 
 
 # ---------------- DB ---------------- #
+def db_network_diagnostics():
+    host = DB_CONFIG.get("host")
+    port = DB_CONFIG.get("port", 3306)
+    try:
+        ip = socket.gethostbyname(host)
+        log(f"✅ CHECKPOINT: DB_HOST resolves {host} -> {ip}:{port}")
+    except Exception as e:
+        log(f"⚠️ CHECKPOINT: DNS resolve failed for {host}: {safe_str(e)}")
+
 def init_db_pool():
     global db_pool
+
+    db_network_diagnostics()
+
+    # 1) Direct connect test (proves real reason)
     try:
-        log("📡 CHECKPOINT: Connecting to Database...")
-        db_pool = mysql.connector.pooling.MySQLConnectionPool(
-            pool_name="screenshot_pool",
-            pool_size=MAX_THREADS + 2,
-            **DB_CONFIG
-        )
-        c = db_pool.get_connection()
+        log("🔎 CHECKPOINT: Direct connect test (no pool)...")
+        c = mysql.connector.connect(**DB_CONFIG)
+        cur = c.cursor()
+        cur.execute("SELECT DATABASE()")
+        dbname = cur.fetchone()[0]
+        cur.close()
         c.close()
-        log("✅ CHECKPOINT: DATABASE CONNECTION SUCCESSFUL")
-        return True
+        log(f"✅ CHECKPOINT: Direct connect OK (db={dbname})")
     except Exception as e:
-        log(f"❌ CHECKPOINT: DATABASE CONNECTION FAILED: {safe_str(e)}")
+        log(f"❌ CHECKPOINT: Direct connect FAILED: {repr(e)}")
         return False
+
+    # 2) Pool with retries (Hostinger sometimes unstable)
+    for attempt in range(1, 6):
+        try:
+            log(f"📡 CHECKPOINT: Connecting to Database pool... attempt={attempt}/5")
+            db_pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="screenshot_pool",
+                pool_size=max(2, MAX_THREADS),
+                pool_reset_session=True,
+                **DB_CONFIG
+            )
+            t = db_pool.get_connection()
+            t.close()
+            log("✅ CHECKPOINT: DATABASE POOL CONNECTION SUCCESSFUL")
+            return True
+        except Exception as e:
+            log(f"❌ CHECKPOINT: POOL CONNECT FAILED attempt {attempt}: {repr(e)}")
+            time.sleep(6)
+
+    return False
 
 def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
     if db_pool is None:
@@ -162,8 +195,13 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
     try:
         conn = db_pool.get_connection()
         cursor = conn.cursor()
-        query = """
-            INSERT INTO next_bagger_review_screenshot (symbol, timeframe, screenshot, chart_date, month_before)
+
+        # confirm DB name (safe)
+        cursor.execute("SELECT DATABASE()")
+        current_db = cursor.fetchone()[0]
+
+        query = f"""
+            INSERT INTO {TARGET_TABLE} (symbol, timeframe, screenshot, chart_date, month_before)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 screenshot = VALUES(screenshot),
@@ -173,11 +211,18 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         """
         cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
         conn.commit()
+
+        # confirm row count in THIS table
+        cursor.execute(f"SELECT COUNT(*) FROM {TARGET_TABLE}")
+        total = cursor.fetchone()[0]
+
+        log(f"✅ DB CONFIRM: host={DB_CONFIG['host']} db={current_db} table={TARGET_TABLE} total_rows_now={total}")
+
         cursor.close()
         conn.close()
         return True
     except Exception as err:
-        log(f"    ❌ DB SAVE ERROR [{symbol}]: {safe_str(err)}")
+        log(f"    ❌ DB SAVE ERROR [{symbol}]: {repr(err)}")
         return False
 
 
@@ -185,7 +230,7 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
 def get_driver():
     opts = Options()
 
-    # ✅ FIX: Use Chromium binary on GitHub runner
+    # ✅ Chromium binary fix (GitHub runner)
     chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
     if not os.path.exists(chrome_bin):
         chrome_bin = "/usr/bin/chromium"
@@ -376,9 +421,9 @@ def process_row(task):
                 db_fail += 1
 
         if ok:
-            log(f"✅ DB OK row#{i}: inserted/updated {symbol} ({target_date})")
+            log(f"✅ DB OK row#{i}: inserted/updated {symbol} ({target_date}) -> {TARGET_TABLE}")
         else:
-            log(f"❌ DB FAIL row#{i}: {symbol} ({target_date})")
+            log(f"❌ DB FAIL row#{i}: {symbol} ({target_date}) -> {TARGET_TABLE}")
 
         write_checkpoint(i)
 
@@ -395,6 +440,7 @@ def main():
     global total_rows
 
     log("🏁 CHECKPOINT: Script started")
+    log(f"✅ CHECKPOINT: Target table = {TARGET_TABLE}")
 
     if not preflight_env_check():
         return
@@ -428,11 +474,12 @@ def main():
         rows_indexed = [t for t in rows_indexed if t[0] >= start_from]
 
         total_rows = len(rows_indexed)
+
         log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), to-run = {total_rows} (resume from last_done={last_done})")
         log(f"✅ CHECKPOINT: Sample main row = {rows[0] if rows else 'EMPTY'}")
 
     except Exception as e:
-        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {safe_str(e)}")
+        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {repr(e)}")
         return
 
     if total_rows == 0:
@@ -447,7 +494,7 @@ def main():
             try:
                 f.result()
             except Exception as e:
-                log(f"🔥 THREAD CRASH: {safe_str(e)}")
+                log(f"🔥 THREAD CRASH: {repr(e)}")
 
     with drivers_lock:
         for d in all_drivers:
