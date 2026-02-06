@@ -13,26 +13,23 @@ from datetime import datetime
 import threading
 
 # ---------------- CONFIG ---------------- #
-# MAIN SHEET (Symbol + URL)
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
 
-# DATE SHEET (Date in Column Z)
+# ✅ ONLY NEW: Read date from this sheet (MV)
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet15"
-DATE_SYMBOL_COL_LETTER = "A"   # assumed Symbol is in Column A in Sheet15
-DATE_DATE_COL_LETTER   = "Z"   # Date is in Column Z in Sheet15
+DATE_COL_LETTER = "Z"      # date is in column Z
+DATE_SYMBOL_COL = "A"      # assumed symbol is in column A in MV sheet
 
-# ✅ For GitHub runner / VPS: 2 is usually fastest & stable
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
-
-# Optional sharding
-SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 progress_lock = threading.Lock()
 processed_count = 0
 total_rows = 0
+
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
+SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
@@ -50,68 +47,62 @@ all_drivers = []
 DATE_MAP = {}  # symbol -> yyyy-mm-dd
 
 
-# ---------------- SMALL HELPERS ---------------- #
+# ---------------- HELPERS ---------------- #
 def col_letter_to_index(letter: str) -> int:
-    """A->0, B->1, ..., Z->25, AA->26 ..."""
     letter = letter.strip().upper()
     n = 0
     for ch in letter:
-        if not ("A" <= ch <= "Z"):
-            continue
-        n = n * 26 + (ord(ch) - ord("A") + 1)
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
 def normalize_date(val: str) -> str:
-    """
-    Try to normalize date into YYYY-MM-DD.
-    Accepts:
-      - YYYY-MM-DD (already)
-      - YYYY/MM/DD
-      - DD-MM-YYYY
-      - DD/MM/YYYY
-    If can't parse, returns original trimmed string.
-    """
     if not val:
         return ""
     s = str(val).strip()
-    s = re.sub(r"\s+", " ", s)
 
-    # already YYYY-MM-DD
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%d")
-        return dt.strftime("%Y-%m-%d")
-    except:
-        pass
-
-    # YYYY/MM/DD
-    try:
-        dt = datetime.strptime(s, "%Y/%m/%d")
-        return dt.strftime("%Y-%m-%d")
-    except:
-        pass
-
-    # DD-MM-YYYY
-    try:
-        dt = datetime.strptime(s, "%d-%m-%Y")
-        return dt.strftime("%Y-%m-%d")
-    except:
-        pass
-
-    # DD/MM/YYYY
-    try:
-        dt = datetime.strptime(s, "%d/%m/%Y")
-        return dt.strftime("%Y-%m-%d")
-    except:
-        pass
-
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except:
+            pass
     return s
+
+def load_date_map(gc):
+    """
+    Load symbol->date from:
+      MV2 for SQL / Sheet15
+      Symbol: Column A (assumed)
+      Date  : Column Z
+    """
+    global DATE_MAP
+    DATE_MAP = {}
+
+    sym_i = col_letter_to_index(DATE_SYMBOL_COL)
+    date_i = col_letter_to_index(DATE_COL_LETTER)
+
+    ss = gc.open(DATE_SPREADSHEET_NAME)
+    ws = ss.worksheet(DATE_TAB_NAME)
+    values = ws.get_all_values()
+
+    # If first row is header, this still works because headers won't match 'NSE:xxxx' style,
+    # and date normalize will fail; harmless.
+    for r in values:
+        if len(r) <= max(sym_i, date_i):
+            continue
+        sym = str(r[sym_i]).strip()
+        dt = normalize_date(r[date_i])
+        if sym and dt:
+            DATE_MAP[sym.upper()] = dt
+
+    print(f"✅ FLAG: Loaded {len(DATE_MAP)} dates from {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} (date col {DATE_COL_LETTER})")
 
 
 # ---------------- DB ---------------- #
 def init_db_pool():
     global db_pool
     try:
-        print("📡 FLAG: Connecting to Database...")
+        print("📡 Flag: Connecting to Database...")
         db_pool = mysql.connector.pooling.MySQLConnectionPool(
             pool_name="screenshot_pool",
             pool_size=MAX_THREADS + 2,
@@ -123,39 +114,34 @@ def init_db_pool():
         print(f"❌ FLAG: DATABASE CONNECTION FAILED: {e}")
         return False
 
-
 def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
     if db_pool is None:
         return False
     try:
         conn = db_pool.get_connection()
         cursor = conn.cursor()
-
         query = """
-            INSERT INTO next_bagger_review_screenshot
-                (symbol, timeframe, screenshot, chart_date, month_before)
+            INSERT INTO another_screenshot (symbol, timeframe, screenshot, chart_date, month_before)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 screenshot = VALUES(screenshot),
+                chart_date = VALUES(chart_date),
                 month_before = VALUES(month_before),
-                updated_at = CURRENT_TIMESTAMP
+                created_at = CURRENT_TIMESTAMP
         """
-
         cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
         conn.commit()
-
         cursor.close()
         conn.close()
         return True
     except Exception as err:
-        print(f"    ❌ DB SAVE ERROR [{symbol}] -> {err}")
+        print(f"    ❌ DB SAVE ERROR [{symbol}]: {err}")
         return False
 
 
 # ---------------- BROWSER ---------------- #
 def get_driver():
     opts = Options()
-
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -170,7 +156,6 @@ def get_driver():
     opts.add_argument("--mute-audio")
     opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    # ✅ block heavy resources (images/fonts)
     prefs = {
         "profile.managed_default_content_settings.images": 2,
         "profile.managed_default_content_settings.fonts": 2,
@@ -187,7 +172,6 @@ def get_driver():
     d.set_page_load_timeout(35)
     d.implicitly_wait(0)
     return d
-
 
 def force_clear_ads(driver):
     try:
@@ -209,7 +193,6 @@ def force_clear_ads(driver):
     except:
         pass
 
-
 def wait_chart_ready(driver, timeout=18):
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
@@ -217,7 +200,6 @@ def wait_chart_ready(driver, timeout=18):
     return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
     )
-
 
 def ensure_thread_driver_logged_in():
     if getattr(thread_local, "driver", None) is None:
@@ -242,10 +224,9 @@ def ensure_thread_driver_logged_in():
                     })
                 d.refresh()
             except Exception as e:
-                print(f"⚠️ FLAG: Cookie load failed: {e}")
+                print(f"⚠️ Cookie load failed: {e}")
 
     return thread_local.driver
-
 
 def goto_date_fast(driver, chart_el, target_date):
     ActionChains(driver).move_to_element(chart_el).click().perform()
@@ -268,40 +249,6 @@ def goto_date_fast(driver, chart_el, target_date):
     force_clear_ads(driver)
 
 
-# ---------------- DATE MAP LOADER ---------------- #
-def load_date_map(gc):
-    """
-    Loads symbol->date from:
-      Spreadsheet: MV2 for SQL
-      Sheet: Sheet15
-      Symbol column: A
-      Date column: Z
-    """
-    global DATE_MAP
-    DATE_MAP = {}
-
-    try:
-        ss = gc.open(DATE_SPREADSHEET_NAME)
-        ws = ss.worksheet(DATE_TAB_NAME)
-        values = ws.get_all_values()
-
-        sym_i = col_letter_to_index(DATE_SYMBOL_COL_LETTER)
-        date_i = col_letter_to_index(DATE_DATE_COL_LETTER)
-
-        for r in values:
-            if len(r) <= max(sym_i, date_i):
-                continue
-            sym = str(r[sym_i]).strip()
-            dt  = normalize_date(r[date_i])
-            if sym and dt:
-                DATE_MAP[sym.upper()] = dt
-
-        print(f"✅ FLAG: DATE MAP LOADED -> {len(DATE_MAP)} symbols from '{DATE_SPREADSHEET_NAME}' / '{DATE_TAB_NAME}' (col {DATE_DATE_COL_LETTER})")
-    except Exception as e:
-        print(f"❌ FLAG: DATE MAP LOAD FAILED: {e}")
-        DATE_MAP = {}
-
-
 # ---------------- WORKER ---------------- #
 def process_row(row):
     global processed_count
@@ -313,10 +260,10 @@ def process_row(row):
     if not symbol or "tradingview.com" not in day_url:
         return
 
-    # date from DATE_MAP using symbol
+    # ✅ ONLY CHANGE: date comes from MV sheet map
     target_date = DATE_MAP.get(symbol.upper(), "")
     if not target_date:
-        print(f"⏭️ FLAG: SKIP {symbol} -> No date found in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_DATE_COL_LETTER}")
+        print(f"⏭️ FLAG: SKIP {symbol} -> no date found in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
         return
 
     with progress_lock:
@@ -325,10 +272,7 @@ def process_row(row):
         if current_idx == 1:
             print(f"ℹ️ FLAG: Threads={MAX_THREADS} | Total={total_rows} (shard {SHARD_INDEX}/{SHARD_STEP})")
 
-    print(f"\n🚀 [{current_idx}/{total_rows}] FLAG: START")
-    print(f"    Symbol : {symbol}")
-    print(f"    URL    : {day_url}")
-    print(f"    Date   : {target_date}  (from {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_DATE_COL_LETTER})")
+    print(f"🚀 [{current_idx}/{total_rows}] Flag: Capturing {symbol} | date={target_date}")
 
     driver = ensure_thread_driver_logged_in()
 
@@ -351,14 +295,13 @@ def process_row(row):
         except:
             pass
 
-        ok = save_to_mysql(symbol, "day", img, target_date, month_val)
-        if ok:
-            print(f"✅ [{current_idx}/{total_rows}] FLAG: DB INSERT/UPDATE OK -> table=next_bagger_review_screenshot | {symbol} | day | {target_date}")
+        if save_to_mysql(symbol, "day", img, target_date, month_val):
+            print(f"✅ [{current_idx}/{total_rows}] FLAG: DB OK - {symbol} ({target_date})")
         else:
-            print(f"❌ [{current_idx}/{total_rows}] FLAG: DB ERROR -> {symbol}")
+            print(f"❌ [{current_idx}/{total_rows}] FLAG: DB ERROR - {symbol}")
 
     except Exception as e:
-        print(f"⚠️ [{current_idx}/{total_rows}] FLAG: ERROR -> {symbol} -> {str(e)[:140]}")
+        print(f"⚠️ [{current_idx}/{total_rows}] FLAG: ERROR {symbol}: {str(e)[:120]}")
 
 
 # ---------------- MAIN ---------------- #
@@ -372,10 +315,10 @@ def main():
         creds = json.loads(os.getenv("GSPREAD_CREDENTIALS"))
         gc = gspread.service_account_from_dict(creds)
 
-        # ✅ load date mapping first
+        # ✅ load MV dates once
         load_date_map(gc)
 
-        # Load main sheet (symbol + url)
+        # load main sheet as-is
         spreadsheet = gc.open(SPREADSHEET_NAME)
         worksheet = spreadsheet.worksheet(TAB_NAME)
         all_values = worksheet.get_all_values()
@@ -385,12 +328,11 @@ def main():
         df = df.loc[:, ~df.columns.duplicated()].copy()
         rows = df.to_dict("records")
 
-        # ✅ shard rows (optional)
         if SHARD_STEP > 1:
             rows = [r for i, r in enumerate(rows) if (i % SHARD_STEP) == SHARD_INDEX]
 
         total_rows = len(rows)
-        print(f"✅ FLAG: LOADED {total_rows} ROWS from '{SPREADSHEET_NAME}' / '{TAB_NAME}' (after shard)")
+        print(f"✅ FLAG: LOADED {total_rows} SYMBOLS (after shard)")
     except Exception as e:
         print(f"❌ FLAG: GOOGLE SHEETS ERROR: {e}")
         return
