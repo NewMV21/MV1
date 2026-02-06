@@ -38,6 +38,7 @@ skipped_no_date = 0
 skipped_bad_row = 0
 db_ok = 0
 db_fail = 0
+selenium_fail = 0
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
@@ -60,6 +61,12 @@ DATE_MAP = {}  # symbol -> yyyy-mm-dd
 def log(msg):
     print(msg, flush=True)
 
+def safe_str(e, n=220):
+    try:
+        return str(e).replace("\n", " ")[:n]
+    except:
+        return "error"
+
 def col_letter_to_index(letter: str) -> int:
     letter = letter.strip().upper()
     n = 0
@@ -72,8 +79,7 @@ def normalize_date(val: str) -> str:
     if not val:
         return ""
     s = str(val).strip()
-
-    # remove weird chars
+    # remove weird chars but keep digits and / -
     s = re.sub(r"[^\d/\-]", "", s)
 
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
@@ -96,10 +102,10 @@ def read_checkpoint():
     try:
         if os.path.exists(CHECKPOINT_FILE):
             v = int(open(CHECKPOINT_FILE, "r").read().strip())
-            return max(v, 0)
+            return max(v, -1)
     except:
         pass
-    return 0
+    return -1
 
 def write_checkpoint(i):
     try:
@@ -125,7 +131,7 @@ def load_date_map(gc):
         if len(r) <= max(sym_i, date_i):
             continue
         sym = str(r[sym_i]).strip()
-        dt  = normalize_date(r[date_i])
+        dt = normalize_date(r[date_i])
         if sym and dt:
             DATE_MAP[sym.upper()] = dt
 
@@ -143,13 +149,13 @@ def init_db_pool():
             pool_size=MAX_THREADS + 2,
             **DB_CONFIG
         )
-        # quick test conn
+        # quick test
         c = db_pool.get_connection()
         c.close()
         log("✅ CHECKPOINT: DATABASE CONNECTION SUCCESSFUL")
         return True
     except Exception as e:
-        log(f"❌ CHECKPOINT: DATABASE CONNECTION FAILED: {e}")
+        log(f"❌ CHECKPOINT: DATABASE CONNECTION FAILED: {safe_str(e)}")
         return False
 
 def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
@@ -173,13 +179,15 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         conn.close()
         return True
     except Exception as err:
-        log(f"    ❌ DB SAVE ERROR [{symbol}]: {err}")
+        log(f"    ❌ DB SAVE ERROR [{symbol}]: {safe_str(err)}")
         return False
 
 
 # ---------------- BROWSER ---------------- #
 def get_driver():
     opts = Options()
+
+    # ✅ headless fast
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -202,9 +210,19 @@ def get_driver():
     opts.add_experimental_option("prefs", prefs)
 
     d = webdriver.Chrome(options=opts)
-    d.set_page_load_timeout(35)
+    d.set_page_load_timeout(45)
     d.implicitly_wait(0)
     return d
+
+def kill_thread_driver():
+    """Kill current thread driver safely and reset it."""
+    try:
+        d = getattr(thread_local, "driver", None)
+        if d:
+            d.quit()
+    except:
+        pass
+    thread_local.driver = None
 
 def force_clear_ads(driver):
     try:
@@ -226,7 +244,7 @@ def force_clear_ads(driver):
     except:
         pass
 
-def wait_chart_ready(driver, timeout=18):
+def wait_chart_ready(driver, timeout=20):
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
     )
@@ -257,7 +275,7 @@ def ensure_thread_driver_logged_in():
                 d.refresh()
                 log("✅ CHECKPOINT: Cookies injected and refreshed")
             except Exception as e:
-                log(f"⚠️ CHECKPOINT: Cookie load failed: {e}")
+                log(f"⚠️ CHECKPOINT: Cookie load failed: {safe_str(e)}")
 
     return thread_local.driver
 
@@ -284,56 +302,78 @@ def goto_date_fast(driver, chart_el, target_date):
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
-    global processed_count, skipped_no_date, skipped_bad_row, db_ok, db_fail
+    """
+    ✅ SAFE worker:
+    - Never lets exception escape (so threadpool doesn't kill the whole run)
+    - Restarts driver if selenium fails
+    """
+    global processed_count, skipped_no_date, skipped_bad_row, db_ok, db_fail, selenium_fail
 
     i, row = task
 
-    row_clean = {str(k).lower().strip(): v for k, v in row.items()}
-    symbol = str(row_clean.get('symbol', '')).strip()
-    day_url = str(row_clean.get('day', '')).strip()
-
-    if not symbol or "tradingview.com" not in day_url:
-        with progress_lock:
-            skipped_bad_row += 1
-        log(f"⏭️ SKIP row#{i}: bad row (symbol/url missing) symbol='{symbol}' url='{day_url}'")
-        write_checkpoint(i)
-        return
-
-    target_date = DATE_MAP.get(symbol.upper(), "")
-    if not target_date:
-        with progress_lock:
-            skipped_no_date += 1
-        log(f"⏭️ SKIP row#{i}: {symbol} -> NO DATE in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
-        write_checkpoint(i)
-        return
-
-    with progress_lock:
-        processed_count += 1
-        current_idx = processed_count
-
-    log(f"🚀 START row#{i} [{current_idx}/{total_rows}] {symbol} | date={target_date}")
-
-    driver = ensure_thread_driver_logged_in()
-
     try:
-        driver.get(day_url)
+        row_clean = {str(k).lower().strip(): v for k, v in row.items()}
+        symbol = str(row_clean.get('symbol', '')).strip()
+        day_url = str(row_clean.get('day', '')).strip()
 
-        chart = wait_chart_ready(driver, timeout=18)
-        force_clear_ads(driver)
+        if not symbol or "tradingview.com" not in day_url:
+            with progress_lock:
+                skipped_bad_row += 1
+            log(f"⏭️ SKIP row#{i}: bad row (symbol/url missing) symbol='{symbol}' url='{day_url}'")
+            write_checkpoint(i)
+            return
 
-        goto_date_fast(driver, chart, target_date)
+        target_date = DATE_MAP.get(symbol.upper(), "")
+        if not target_date:
+            with progress_lock:
+                skipped_no_date += 1
+            log(f"⏭️ SKIP row#{i}: {symbol} -> NO DATE in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
+            write_checkpoint(i)
+            return
 
-        chart = wait_chart_ready(driver, timeout=12)
-        force_clear_ads(driver)
+        with progress_lock:
+            processed_count += 1
+            current_idx = processed_count
 
-        img = chart.screenshot_as_png
+        log(f"🚀 START row#{i} [{current_idx}/{total_rows}] {symbol} | date={target_date}")
 
+        # --- Selenium protected section ---
+        try:
+            driver = ensure_thread_driver_logged_in()
+
+            log(f"   🌐 GET: {symbol}")
+            driver.get(day_url)
+
+            log(f"   📈 WAIT CHART: {symbol}")
+            chart = wait_chart_ready(driver, timeout=20)
+            force_clear_ads(driver)
+
+            log(f"   🗓️ GOTO DATE: {symbol} -> {target_date}")
+            goto_date_fast(driver, chart, target_date)
+
+            log(f"   📸 SCREENSHOT: {symbol}")
+            chart = wait_chart_ready(driver, timeout=15)
+            force_clear_ads(driver)
+            img = chart.screenshot_as_png
+
+        except Exception as se:
+            with progress_lock:
+                selenium_fail += 1
+                db_fail += 1
+            log(f"⚠️ SELENIUM ERROR row#{i}: {symbol} -> {safe_str(se)}")
+            # restart driver for this thread
+            kill_thread_driver()
+            write_checkpoint(i)
+            return
+
+        # Month value
         month_val = "Unknown"
         try:
             month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
         except:
             pass
 
+        # DB save
         ok = save_to_mysql(symbol, "day", img, target_date, month_val)
         with progress_lock:
             if ok:
@@ -346,13 +386,16 @@ def process_row(task):
         else:
             log(f"❌ DB FAIL row#{i}: {symbol} ({target_date})")
 
+        # ✅ checkpoint should store completed row index
+        write_checkpoint(i)
+
     except Exception as e:
+        # ✅ absolutely never crash threadpool
         with progress_lock:
             db_fail += 1
-        log(f"⚠️ ERROR row#{i}: {symbol} -> {str(e)[:160]}")
-
-    # update checkpoint after finishing this row
-    write_checkpoint(i)
+        log(f"🔥 FATAL ROW ERROR row#{i}: {safe_str(e)}")
+        write_checkpoint(i)
+        return
 
 
 # ---------------- MAIN ---------------- #
@@ -389,17 +432,20 @@ def main():
         if SHARD_STEP > 1:
             rows = [r for idx, r in enumerate(rows) if (idx % SHARD_STEP) == SHARD_INDEX]
 
-        start_from = read_checkpoint()
-        # We store checkpoint as row index "i". Continue from next row.
+        last_done = read_checkpoint()  # -1 means start fresh
+        # Continue from next row
+        start_from = last_done + 1
+
         rows_indexed = list(enumerate(rows))
         rows_indexed = [t for t in rows_indexed if t[0] >= start_from]
 
         total_rows = len(rows_indexed)
-        log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), shard rows = {len(rows_indexed)} (resume from {start_from})")
+
+        log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), to-run = {total_rows} (resume from last_done={last_done})")
         log(f"✅ CHECKPOINT: Sample main row = {rows[0] if rows else 'EMPTY'}")
 
     except Exception as e:
-        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {e}")
+        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {safe_str(e)}")
         return
 
     if total_rows == 0:
@@ -408,9 +454,17 @@ def main():
 
     log(f"ℹ️ CHECKPOINT: Starting ThreadPool MAX_THREADS={MAX_THREADS}")
 
+    # ✅ DO NOT use executor.map (it can crash whole run on one error)
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        list(executor.map(process_row, rows_indexed))
+        futures = [executor.submit(process_row, t) for t in rows_indexed]
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                # should not happen now, but just in case
+                log(f"🔥 THREAD CRASH: {safe_str(e)}")
 
+    # close browsers
     with drivers_lock:
         for d in all_drivers:
             try:
@@ -419,7 +473,7 @@ def main():
                 pass
 
     log("\n🏁 COMPLETED.")
-    log(f"📊 SUMMARY: processed={processed_count}, db_ok={db_ok}, db_fail={db_fail}, skipped_no_date={skipped_no_date}, skipped_bad_row={skipped_bad_row}")
+    log(f"📊 SUMMARY: processed={processed_count}, db_ok={db_ok}, db_fail={db_fail}, selenium_fail={selenium_fail}, skipped_no_date={skipped_no_date}, skipped_bad_row={skipped_bad_row}")
     log(f"🧾 Checkpoint file used: {CHECKPOINT_FILE}")
 
 
