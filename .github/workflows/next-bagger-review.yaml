@@ -34,4 +34,4 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
           TRADINGVIEW_COOKIES: ${{ secrets.TRADINGVIEW_COOKIES }}
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-        run: python another-screen.py
+        run: python nextbagger-review.py
