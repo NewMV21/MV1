@@ -163,7 +163,7 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         conn = db_pool.get_connection()
         cursor = conn.cursor()
         query = """
-            INSERT INTO another_screenshot (symbol, timeframe, screenshot, chart_date, month_before)
+            INSERT INTO next_bagger_review_screenshot (symbol, timeframe, screenshot, chart_date, month_before)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 screenshot = VALUES(screenshot),
