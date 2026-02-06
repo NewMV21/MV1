@@ -1,4 +1,4 @@
-name: TradingView Another Screenshot Bot
+name: TradingView NextBagger Review Bot
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
       - name: Install Chromium + Chromedriver + Python deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver
+          sudo apt-get install -y chromium-browser chromium-chromedriver netcat dnsutils
           python -m pip install --upgrade pip
           pip install pandas selenium gspread mysql-connector-python
 
@@ -30,20 +30,37 @@ jobs:
           chromium-browser --version || true
           echo "✅ Chromedriver:"
           chromedriver --version || true
-          echo "✅ Chromium path:"
+          echo "✅ Paths:"
           which chromium-browser || true
           which chromium || true
+          which chromedriver || true
+
+      - name: Debug DB reachability (DNS + PORT)
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: "3306"
+        run: |
+          echo "DB_HOST=$DB_HOST"
+          echo "DB_PORT=$DB_PORT"
+          echo "Resolving DB_HOST..."
+          nslookup $DB_HOST || true
+          echo "Testing port 3306..."
+          nc -zv $DB_HOST 3306 || true
 
       - name: Run Script
         env:
           PYTHONUNBUFFERED: "1"
           CHROME_BIN: "/usr/bin/chromium-browser"
+
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: "3306"
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
+
           TRADINGVIEW_COOKIES: ${{ secrets.TRADINGVIEW_COOKIES }}
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+
           MAX_THREADS: "2"
+          CHECKPOINT_FILE: "checkpoint_nextbagger.txt"
         run: python nextbagger-review.py
