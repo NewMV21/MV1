@@ -16,7 +16,7 @@ import threading
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
 
-# ✅ ONLY NEW: Read date from this sheet (MV)
+# ✅ Only date comes from MV sheet
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet15"
 DATE_COL_LETTER = "Z"      # date is in column Z
@@ -24,18 +24,27 @@ DATE_SYMBOL_COL = "A"      # assumed symbol is in column A in MV sheet
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
+SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
+
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_nextbagger.txt")
+
 progress_lock = threading.Lock()
 processed_count = 0
 total_rows = 0
 
-SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
+# counters
+skipped_no_date = 0
+skipped_bad_row = 0
+db_ok = 0
+db_fail = 0
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "database": os.getenv("DB_NAME"),
+    "port": int(os.getenv("DB_PORT", "3306")),
     "connect_timeout": 30
 }
 
@@ -48,6 +57,9 @@ DATE_MAP = {}  # symbol -> yyyy-mm-dd
 
 
 # ---------------- HELPERS ---------------- #
+def log(msg):
+    print(msg, flush=True)
+
 def col_letter_to_index(letter: str) -> int:
     letter = letter.strip().upper()
     n = 0
@@ -61,20 +73,44 @@ def normalize_date(val: str) -> str:
         return ""
     s = str(val).strip()
 
+    # remove weird chars
+    s = re.sub(r"[^\d/\-]", "", s)
+
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except:
             pass
-    return s
+    return ""
 
+def preflight_env_check():
+    required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "GSPREAD_CREDENTIALS", "TRADINGVIEW_COOKIES"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        log(f"❌ PRECHECK: Missing env vars: {missing}")
+        return False
+    log("✅ PRECHECK: Env vars present")
+    return True
+
+def read_checkpoint():
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            v = int(open(CHECKPOINT_FILE, "r").read().strip())
+            return max(v, 0)
+    except:
+        pass
+    return 0
+
+def write_checkpoint(i):
+    try:
+        with open(CHECKPOINT_FILE, "w") as f:
+            f.write(str(i))
+    except:
+        pass
+
+
+# ---------------- DATE MAP ---------------- #
 def load_date_map(gc):
-    """
-    Load symbol->date from:
-      MV2 for SQL / Sheet15
-      Symbol: Column A (assumed)
-      Date  : Column Z
-    """
     global DATE_MAP
     DATE_MAP = {}
 
@@ -85,33 +121,35 @@ def load_date_map(gc):
     ws = ss.worksheet(DATE_TAB_NAME)
     values = ws.get_all_values()
 
-    # If first row is header, this still works because headers won't match 'NSE:xxxx' style,
-    # and date normalize will fail; harmless.
     for r in values:
         if len(r) <= max(sym_i, date_i):
             continue
         sym = str(r[sym_i]).strip()
-        dt = normalize_date(r[date_i])
+        dt  = normalize_date(r[date_i])
         if sym and dt:
             DATE_MAP[sym.upper()] = dt
 
-    print(f"✅ FLAG: Loaded {len(DATE_MAP)} dates from {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} (date col {DATE_COL_LETTER})")
+    log(f"✅ CHECKPOINT: DATE_MAP loaded = {len(DATE_MAP)} from {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} (Symbol {DATE_SYMBOL_COL}, Date {DATE_COL_LETTER})")
+    log(f"✅ CHECKPOINT: DATE_MAP sample = {list(DATE_MAP.items())[:5]}")
 
 
 # ---------------- DB ---------------- #
 def init_db_pool():
     global db_pool
     try:
-        print("📡 Flag: Connecting to Database...")
+        log("📡 CHECKPOINT: Connecting to Database...")
         db_pool = mysql.connector.pooling.MySQLConnectionPool(
             pool_name="screenshot_pool",
             pool_size=MAX_THREADS + 2,
             **DB_CONFIG
         )
-        print("✅ FLAG: DATABASE CONNECTION SUCCESSFUL")
+        # quick test conn
+        c = db_pool.get_connection()
+        c.close()
+        log("✅ CHECKPOINT: DATABASE CONNECTION SUCCESSFUL")
         return True
     except Exception as e:
-        print(f"❌ FLAG: DATABASE CONNECTION FAILED: {e}")
+        log(f"❌ CHECKPOINT: DATABASE CONNECTION FAILED: {e}")
         return False
 
 def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
@@ -135,7 +173,7 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         conn.close()
         return True
     except Exception as err:
-        print(f"    ❌ DB SAVE ERROR [{symbol}]: {err}")
+        log(f"    ❌ DB SAVE ERROR [{symbol}]: {err}")
         return False
 
 
@@ -162,11 +200,6 @@ def get_driver():
         "profile.default_content_setting_values.notifications": 2,
     }
     opts.add_experimental_option("prefs", prefs)
-
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
 
     d = webdriver.Chrome(options=opts)
     d.set_page_load_timeout(35)
@@ -205,7 +238,6 @@ def ensure_thread_driver_logged_in():
     if getattr(thread_local, "driver", None) is None:
         d = get_driver()
         thread_local.driver = d
-
         with drivers_lock:
             all_drivers.append(d)
 
@@ -223,8 +255,9 @@ def ensure_thread_driver_logged_in():
                         "path": "/"
                     })
                 d.refresh()
+                log("✅ CHECKPOINT: Cookies injected and refreshed")
             except Exception as e:
-                print(f"⚠️ Cookie load failed: {e}")
+                log(f"⚠️ CHECKPOINT: Cookie load failed: {e}")
 
     return thread_local.driver
 
@@ -250,29 +283,35 @@ def goto_date_fast(driver, chart_el, target_date):
 
 
 # ---------------- WORKER ---------------- #
-def process_row(row):
-    global processed_count
+def process_row(task):
+    global processed_count, skipped_no_date, skipped_bad_row, db_ok, db_fail
+
+    i, row = task
 
     row_clean = {str(k).lower().strip(): v for k, v in row.items()}
     symbol = str(row_clean.get('symbol', '')).strip()
     day_url = str(row_clean.get('day', '')).strip()
 
     if not symbol or "tradingview.com" not in day_url:
+        with progress_lock:
+            skipped_bad_row += 1
+        log(f"⏭️ SKIP row#{i}: bad row (symbol/url missing) symbol='{symbol}' url='{day_url}'")
+        write_checkpoint(i)
         return
 
-    # ✅ ONLY CHANGE: date comes from MV sheet map
     target_date = DATE_MAP.get(symbol.upper(), "")
     if not target_date:
-        print(f"⏭️ FLAG: SKIP {symbol} -> no date found in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
+        with progress_lock:
+            skipped_no_date += 1
+        log(f"⏭️ SKIP row#{i}: {symbol} -> NO DATE in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
+        write_checkpoint(i)
         return
 
     with progress_lock:
         processed_count += 1
         current_idx = processed_count
-        if current_idx == 1:
-            print(f"ℹ️ FLAG: Threads={MAX_THREADS} | Total={total_rows} (shard {SHARD_INDEX}/{SHARD_STEP})")
 
-    print(f"🚀 [{current_idx}/{total_rows}] Flag: Capturing {symbol} | date={target_date}")
+    log(f"🚀 START row#{i} [{current_idx}/{total_rows}] {symbol} | date={target_date}")
 
     driver = ensure_thread_driver_logged_in()
 
@@ -295,18 +334,35 @@ def process_row(row):
         except:
             pass
 
-        if save_to_mysql(symbol, "day", img, target_date, month_val):
-            print(f"✅ [{current_idx}/{total_rows}] FLAG: DB OK - {symbol} ({target_date})")
+        ok = save_to_mysql(symbol, "day", img, target_date, month_val)
+        with progress_lock:
+            if ok:
+                db_ok += 1
+            else:
+                db_fail += 1
+
+        if ok:
+            log(f"✅ DB OK row#{i}: inserted/updated {symbol} ({target_date})")
         else:
-            print(f"❌ [{current_idx}/{total_rows}] FLAG: DB ERROR - {symbol}")
+            log(f"❌ DB FAIL row#{i}: {symbol} ({target_date})")
 
     except Exception as e:
-        print(f"⚠️ [{current_idx}/{total_rows}] FLAG: ERROR {symbol}: {str(e)[:120]}")
+        with progress_lock:
+            db_fail += 1
+        log(f"⚠️ ERROR row#{i}: {symbol} -> {str(e)[:160]}")
+
+    # update checkpoint after finishing this row
+    write_checkpoint(i)
 
 
 # ---------------- MAIN ---------------- #
 def main():
     global total_rows
+
+    log("🏁 CHECKPOINT: Script started")
+
+    if not preflight_env_check():
+        return
 
     if not init_db_pool():
         return
@@ -314,11 +370,12 @@ def main():
     try:
         creds = json.loads(os.getenv("GSPREAD_CREDENTIALS"))
         gc = gspread.service_account_from_dict(creds)
+        log("✅ CHECKPOINT: Google credentials loaded")
 
-        # ✅ load MV dates once
+        # MV date map
         load_date_map(gc)
 
-        # load main sheet as-is
+        # main sheet
         spreadsheet = gc.open(SPREADSHEET_NAME)
         worksheet = spreadsheet.worksheet(TAB_NAME)
         all_values = worksheet.get_all_values()
@@ -328,17 +385,31 @@ def main():
         df = df.loc[:, ~df.columns.duplicated()].copy()
         rows = df.to_dict("records")
 
+        # shard
         if SHARD_STEP > 1:
-            rows = [r for i, r in enumerate(rows) if (i % SHARD_STEP) == SHARD_INDEX]
+            rows = [r for idx, r in enumerate(rows) if (idx % SHARD_STEP) == SHARD_INDEX]
 
-        total_rows = len(rows)
-        print(f"✅ FLAG: LOADED {total_rows} SYMBOLS (after shard)")
+        start_from = read_checkpoint()
+        # We store checkpoint as row index "i". Continue from next row.
+        rows_indexed = list(enumerate(rows))
+        rows_indexed = [t for t in rows_indexed if t[0] >= start_from]
+
+        total_rows = len(rows_indexed)
+        log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), shard rows = {len(rows_indexed)} (resume from {start_from})")
+        log(f"✅ CHECKPOINT: Sample main row = {rows[0] if rows else 'EMPTY'}")
+
     except Exception as e:
-        print(f"❌ FLAG: GOOGLE SHEETS ERROR: {e}")
+        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {e}")
         return
 
+    if total_rows == 0:
+        log("⚠️ CHECKPOINT: Nothing to process (total_rows=0). Check shard/checkpoint.")
+        return
+
+    log(f"ℹ️ CHECKPOINT: Starting ThreadPool MAX_THREADS={MAX_THREADS}")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        list(executor.map(process_row, rows))
+        list(executor.map(process_row, rows_indexed))
 
     with drivers_lock:
         for d in all_drivers:
@@ -347,7 +418,9 @@ def main():
             except:
                 pass
 
-    print("\n🏁 FLAG: COMPLETED.")
+    log("\n🏁 COMPLETED.")
+    log(f"📊 SUMMARY: processed={processed_count}, db_ok={db_ok}, db_fail={db_fail}, skipped_no_date={skipped_no_date}, skipped_bad_row={skipped_bad_row}")
+    log(f"🧾 Checkpoint file used: {CHECKPOINT_FILE}")
 
 
 if __name__ == "__main__":
