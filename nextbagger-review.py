@@ -23,7 +23,7 @@ DATE_COL_LETTER = "Z"
 DATE_SYMBOL_COL = "A"
 
 # ✅ target table
-TARGET_TABLE = "nextbaggernew"  # IMPORTANT
+TARGET_TABLE = "next_bagger_review_screenshot"  # IMPORTANT
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 
