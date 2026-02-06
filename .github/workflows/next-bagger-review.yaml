@@ -1,7 +1,7 @@
 name: TradingView Another Screenshot Bot
 
 on:
-  workflow_dispatch: # Manual run button
+  workflow_dispatch:
   schedule:
     - cron: '30 13 * * *'   # 7:00 PM IST (13:30 UTC)
 
@@ -19,19 +19,27 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Chrome and Dependencies
+      - name: Install Chrome + Driver + Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          pip install pandas selenium webdriver-manager gspread mysql-connector-python
+          sudo apt-get install -y chromium-browser chromium-chromedriver
+          python -m pip install --upgrade pip
+          pip install pandas selenium gspread mysql-connector-python
+
+          echo "✅ Chromium version:"
+          chromium-browser --version || true
+          echo "✅ Chromedriver version:"
+          chromedriver --version || true
 
       - name: Run Script
         env:
+          PYTHONUNBUFFERED: "1"
           DB_HOST: ${{ secrets.DB_HOST }}
-          DB_PORT: 3306
+          DB_PORT: "3306"
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           TRADINGVIEW_COOKIES: ${{ secrets.TRADINGVIEW_COOKIES }}
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          MAX_THREADS: "2"
         run: python nextbagger-review.py
