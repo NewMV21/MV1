@@ -19,8 +19,8 @@ TAB_NAME = "Weekday"
 # ✅ Only date comes from MV sheet
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet15"
-DATE_COL_LETTER = "Z"      # date is in column Z
-DATE_SYMBOL_COL = "A"      # assumed symbol is in column A in MV sheet
+DATE_COL_LETTER = "Z"
+DATE_SYMBOL_COL = "A"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 
@@ -79,7 +79,6 @@ def normalize_date(val: str) -> str:
     if not val:
         return ""
     s = str(val).strip()
-    # remove weird chars but keep digits and / -
     s = re.sub(r"[^\d/\-]", "", s)
 
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
@@ -149,7 +148,6 @@ def init_db_pool():
             pool_size=MAX_THREADS + 2,
             **DB_CONFIG
         )
-        # quick test
         c = db_pool.get_connection()
         c.close()
         log("✅ CHECKPOINT: DATABASE CONNECTION SUCCESSFUL")
@@ -187,7 +185,13 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
 def get_driver():
     opts = Options()
 
-    # ✅ headless fast
+    # ✅ FIX: Use Chromium binary on GitHub runner
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if not os.path.exists(chrome_bin):
+        chrome_bin = "/usr/bin/chromium"
+    opts.binary_location = chrome_bin
+    log(f"✅ CHECKPOINT: Using Chrome binary = {chrome_bin}")
+
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -215,7 +219,6 @@ def get_driver():
     return d
 
 def kill_thread_driver():
-    """Kill current thread driver safely and reset it."""
     try:
         d = getattr(thread_local, "driver", None)
         if d:
@@ -302,11 +305,6 @@ def goto_date_fast(driver, chart_el, target_date):
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
-    """
-    ✅ SAFE worker:
-    - Never lets exception escape (so threadpool doesn't kill the whole run)
-    - Restarts driver if selenium fails
-    """
     global processed_count, skipped_no_date, skipped_bad_row, db_ok, db_fail, selenium_fail
 
     i, row = task
@@ -337,7 +335,6 @@ def process_row(task):
 
         log(f"🚀 START row#{i} [{current_idx}/{total_rows}] {symbol} | date={target_date}")
 
-        # --- Selenium protected section ---
         try:
             driver = ensure_thread_driver_logged_in()
 
@@ -361,19 +358,16 @@ def process_row(task):
                 selenium_fail += 1
                 db_fail += 1
             log(f"⚠️ SELENIUM ERROR row#{i}: {symbol} -> {safe_str(se)}")
-            # restart driver for this thread
             kill_thread_driver()
             write_checkpoint(i)
             return
 
-        # Month value
         month_val = "Unknown"
         try:
             month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
         except:
             pass
 
-        # DB save
         ok = save_to_mysql(symbol, "day", img, target_date, month_val)
         with progress_lock:
             if ok:
@@ -386,11 +380,9 @@ def process_row(task):
         else:
             log(f"❌ DB FAIL row#{i}: {symbol} ({target_date})")
 
-        # ✅ checkpoint should store completed row index
         write_checkpoint(i)
 
     except Exception as e:
-        # ✅ absolutely never crash threadpool
         with progress_lock:
             db_fail += 1
         log(f"🔥 FATAL ROW ERROR row#{i}: {safe_str(e)}")
@@ -415,10 +407,8 @@ def main():
         gc = gspread.service_account_from_dict(creds)
         log("✅ CHECKPOINT: Google credentials loaded")
 
-        # MV date map
         load_date_map(gc)
 
-        # main sheet
         spreadsheet = gc.open(SPREADSHEET_NAME)
         worksheet = spreadsheet.worksheet(TAB_NAME)
         all_values = worksheet.get_all_values()
@@ -428,19 +418,16 @@ def main():
         df = df.loc[:, ~df.columns.duplicated()].copy()
         rows = df.to_dict("records")
 
-        # shard
         if SHARD_STEP > 1:
             rows = [r for idx, r in enumerate(rows) if (idx % SHARD_STEP) == SHARD_INDEX]
 
-        last_done = read_checkpoint()  # -1 means start fresh
-        # Continue from next row
+        last_done = read_checkpoint()
         start_from = last_done + 1
 
         rows_indexed = list(enumerate(rows))
         rows_indexed = [t for t in rows_indexed if t[0] >= start_from]
 
         total_rows = len(rows_indexed)
-
         log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), to-run = {total_rows} (resume from last_done={last_done})")
         log(f"✅ CHECKPOINT: Sample main row = {rows[0] if rows else 'EMPTY'}")
 
@@ -454,17 +441,14 @@ def main():
 
     log(f"ℹ️ CHECKPOINT: Starting ThreadPool MAX_THREADS={MAX_THREADS}")
 
-    # ✅ DO NOT use executor.map (it can crash whole run on one error)
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         futures = [executor.submit(process_row, t) for t in rows_indexed]
         for f in concurrent.futures.as_completed(futures):
             try:
                 f.result()
             except Exception as e:
-                # should not happen now, but just in case
                 log(f"🔥 THREAD CRASH: {safe_str(e)}")
 
-    # close browsers
     with drivers_lock:
         for d in all_drivers:
             try:
