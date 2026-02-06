@@ -22,7 +22,7 @@ jobs:
       - name: Install Chromium + Chromedriver + Python deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver netcat dnsutils
+          sudo apt-get install -y chromium-browser chromium-chromedriver netcat-openbsd dnsutils
           python -m pip install --upgrade pip
           pip install pandas selenium gspread mysql-connector-python
 
