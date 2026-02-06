@@ -19,21 +19,25 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Chrome + Driver + Dependencies
+      - name: Install Chromium + Chromedriver + Python deps
         run: |
           sudo apt-get update
           sudo apt-get install -y chromium-browser chromium-chromedriver
           python -m pip install --upgrade pip
           pip install pandas selenium gspread mysql-connector-python
 
-          echo "✅ Chromium version:"
+          echo "✅ Chromium:"
           chromium-browser --version || true
-          echo "✅ Chromedriver version:"
+          echo "✅ Chromedriver:"
           chromedriver --version || true
+          echo "✅ Chromium path:"
+          which chromium-browser || true
+          which chromium || true
 
       - name: Run Script
         env:
           PYTHONUNBUFFERED: "1"
+          CHROME_BIN: "/usr/bin/chromium-browser"
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: "3306"
           DB_USER: ${{ secrets.DB_USER }}
