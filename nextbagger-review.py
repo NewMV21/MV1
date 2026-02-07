@@ -1,4 +1,4 @@
-import os, time, json, gspread, concurrent.futures, re, socket
+import os, time, json, gspread, concurrent.futures, re, socket, hashlib
 import pandas as pd
 import mysql.connector
 from mysql.connector import pooling
@@ -196,7 +196,6 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         conn = db_pool.get_connection()
         cursor = conn.cursor()
 
-        # confirm DB name (safe)
         cursor.execute("SELECT DATABASE()")
         current_db = cursor.fetchone()[0]
 
@@ -212,7 +211,6 @@ def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
         cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
         conn.commit()
 
-        # confirm row count in THIS table
         cursor.execute(f"SELECT COUNT(*) FROM {TARGET_TABLE}")
         total = cursor.fetchone()[0]
 
@@ -299,6 +297,64 @@ def wait_chart_ready(driver, timeout=20):
     return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
     )
+
+# ✅ NEW: waits just enough so indicators finish drawing (fast on already-loaded charts)
+def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=6.0):
+    """
+    Goal: avoid screenshot before indicators load.
+    Fast path: if already stable, returns quickly (usually < 0.8s).
+    Strategy:
+      1) wait until typical loading spinners/progress are gone (best-effort)
+      2) require 2 consecutive identical chart element screenshots (hash-based)
+    """
+    end = time.time() + max_wait
+
+    def has_loading():
+        try:
+            return driver.execute_script("""
+                const sels = [
+                  "[data-name='spinner']",
+                  "[class*='spinner']",
+                  "[class*='loading']",
+                  "[class*='progress']",
+                  "div[class*='loader']"
+                ];
+                for (const s of sels) {
+                  const el = document.querySelector(s);
+                  if (el && el.offsetParent !== null) return true;
+                }
+                return false;
+            """)
+        except:
+            return False
+
+    # (1) brief wait for loaders to disappear (doesn't block long)
+    while time.time() < end and has_loading():
+        time.sleep(0.25)
+
+    # (2) stability via element screenshot hash
+    last_h = None
+    stable_hits = 0
+    while time.time() < end:
+        try:
+            png = chart_el.screenshot_as_png
+            h = hashlib.md5(png).hexdigest()
+        except:
+            # if element reference became stale, caller will re-find chart
+            return False
+
+        if h == last_h:
+            stable_hits += 1
+            if stable_hits >= 2:
+                return True
+        else:
+            stable_hits = 0
+            last_h = h
+
+        time.sleep(0.35)
+
+    # if time runs out, still return True-ish (we tried); caller can proceed
+    return True
 
 def ensure_thread_driver_logged_in():
     if getattr(thread_local, "driver", None) is None:
@@ -393,8 +449,15 @@ def process_row(task):
             log(f"   🗓️ GOTO DATE: {symbol} -> {target_date}")
             goto_date_fast(driver, chart, target_date)
 
+            # ✅ UPDATED: wait for indicators to fully draw, but keep it fast
+            log(f"   ⏳ STABILIZE: {symbol} (fast wait for indicators)")
+            chart = wait_chart_ready(driver, timeout=15)  # re-grab
+            force_clear_ads(driver)
+            wait_chart_stable_for_screenshot(driver, chart, max_wait=6.0)
+
             log(f"   📸 SCREENSHOT: {symbol}")
-            chart = wait_chart_ready(driver, timeout=15)
+            # one last re-grab (handles rare DOM refresh)
+            chart = wait_chart_ready(driver, timeout=10)
             force_clear_ads(driver)
             img = chart.screenshot_as_png
 
