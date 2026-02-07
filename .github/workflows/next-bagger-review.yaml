@@ -1,9 +1,7 @@
 name: TradingView NextBagger Review Bot
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '30 13 * * *'   # 7:00 PM IST (13:30 UTC)
+  workflow_dispatch:   # ✅ Manual trigger only
 
 jobs:
   run-bot:
