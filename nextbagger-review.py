@@ -31,14 +31,15 @@ def log(msg):
 def load_date_map(gc):
     global DATE_MAP
     try:
+        # CD is column 82 (index 81)
         values = gc.open(DATE_SPREADSHEET_NAME).worksheet(DATE_TAB_NAME).get_all_values()
         for r in values:
-            if len(r) >= 82: # Column CD is index 81
+            if len(r) >= 82:
                 sym = str(r[0]).strip().upper()
                 dt = str(r[81]).strip()
                 if sym and dt: DATE_MAP[sym] = dt
-        log(f"✅ Loaded {len(DATE_MAP)} dates")
-    except Exception as e: log(f"Date Map Error: {e}")
+        log(f"✅ Loaded {len(DATE_MAP)} dates from Date Map")
+    except Exception as e: log(f"❌ Date Map Error: {e}")
 
 def init_db_pool():
     global db_pool
@@ -50,7 +51,7 @@ def init_db_pool():
         password=os.getenv("DB_PASSWORD"),
         database=os.getenv("DB_NAME"),
         port=int(os.getenv("DB_PORT", "3306")),
-        connection_timeout=20 # Prevents hanging if firewall blocks GitHub
+        connection_timeout=20
     )
 
 def save_to_mysql(symbol, image, date):
@@ -77,42 +78,60 @@ def get_driver():
     
     driver = webdriver.Chrome(options=opts)
     driver.get("https://www.tradingview.com/chart/")
-    cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
-    for c in cookies:
-        driver.add_cookie({"name": c["name"], "value": c["value"], "domain": ".tradingview.com", "path": "/"})
-    driver.refresh()
+    
+    try:
+        cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
+        for c in cookies:
+            driver.add_cookie({"name": c["name"], "value": c["value"], "domain": ".tradingview.com", "path": "/"})
+        driver.refresh()
+    except:
+        log("⚠️ Cookie warning: Continuing without cookies")
+    
     return driver
 
 # ---------------- WORKER ---------------- #
-def process_row(task):
-    _, row = task
-    symbol = str(row.get('Symbol', '')).strip()
-    day_url = str(row.get('Chart Link', '')).strip() # Ensure column name matches your sheet
+def process_row(row_data):
+    if len(row_data) < 4: return
+
+    symbol = str(row_data[0]).strip()
+    day_url = str(row_data[3]).strip() # Column D
     target_date = DATE_MAP.get(symbol.upper())
 
-    if not symbol or not day_url or not target_date: return
+    if not symbol or not day_url or not target_date:
+        return
 
     try:
-        if not hasattr(thread_local, "driver"): thread_local.driver = get_driver()
+        if not hasattr(thread_local, "driver"): 
+            thread_local.driver = get_driver()
+        
         driver = thread_local.driver
-        
         driver.get(day_url)
-        chart = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CLASS_NAME, "chart-container")))
         
-        # Navigate to Date
+        # Wait for chart
+        chart = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
+        )
+        
+        # Go to Date
         ActionChains(driver).move_to_element(chart).click().perform()
+        time.sleep(1)
         ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
         
-        input_box = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[data-role='datepicker']")))
+        input_box = WebDriverWait(driver, 10).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "input[data-role='datepicker']"))
+        )
         input_box.send_keys(Keys.CONTROL + "a", Keys.BACKSPACE)
         input_box.send_keys(target_date, Keys.ENTER)
         
-        time.sleep(5) # Simple wait for chart to jump and load
-        save_to_mysql(symbol, chart.screenshot_as_png, target_date)
-        log(f"✅ {symbol} Saved")
+        # Allow time for jump and render
+        time.sleep(6) 
+        
+        img = chart.screenshot_as_png
+        save_to_mysql(symbol, img, target_date)
+        log(f"✅ Captured: {symbol}")
 
     except Exception as e:
-        log(f"❌ {symbol} failed: {e}")
+        log(f"❌ Error {symbol}: {str(e)[:100]}")
 
 # ---------------- MAIN ---------------- #
 def main():
@@ -121,13 +140,23 @@ def main():
     load_date_map(gc)
 
     ws = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
-    data = ws.get_all_records()
+    all_values = ws.get_all_values()
     
-    log(f"🚀 Starting {len(data)} tasks...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        executor.map(process_row, list(enumerate(data)))
+    # Filter out header and empty rows
+    data_rows = [r for r in all_values[1:] if len(r) > 0 and r[0].strip()]
+    
+    if not data_rows:
+        log("❌ No data found in the spreadsheet!")
+        return
 
-    if hasattr(thread_local, "driver"): thread_local.driver.quit()
+    log(f"🚀 Processing {len(data_rows)} rows using {MAX_THREADS} threads...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        executor.map(process_row, data_rows)
+
+    if hasattr(thread_local, "driver"):
+        thread_local.driver.quit()
+    
     log("🏁 Done.")
 
 if __name__ == "__main__":
