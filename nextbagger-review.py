@@ -21,7 +21,7 @@ DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
-TARGET_TABLE = "next_bagger_review_screenshot" 
+TARGET_TABLE = "next_bag_review_screenshot"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
@@ -166,7 +166,6 @@ def get_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1600,900")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    
     d = webdriver.Chrome(options=opts)
     d.set_page_load_timeout(45)
     return d
@@ -212,13 +211,13 @@ def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=6.0):
         time.sleep(0.4)
     return True
 
-def change_timeframe(driver, tf_char):
-    """tf_char: 'D' for Day, 'W' for Week"""
+def force_timeframe(driver, tf_key):
     try:
-        ActionChains(driver).send_keys(tf_char).perform()
-        time.sleep(0.2)
-        ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(1.0)
+        actions = ActionChains(driver)
+        actions.send_keys(tf_key).perform()
+        time.sleep(0.5)
+        actions.send_keys(Keys.ENTER).perform()
+        time.sleep(1.5) 
     except: pass
 
 def goto_date_fast(driver, chart_el, target_date):
@@ -231,7 +230,7 @@ def goto_date_fast(driver, chart_el, target_date):
     box.send_keys(Keys.BACKSPACE)
     box.send_keys(target_date)
     box.send_keys(Keys.ENTER)
-    time.sleep(1.2)
+    time.sleep(1.5)
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
@@ -240,9 +239,12 @@ def process_row(task):
     try:
         row_clean = {str(k).lower().strip(): v for k, v in row.items()}
         symbol = str(row_clean.get('symbol', '')).strip()
+        
+        # ✅ Fetch distinct URLs from headers
         day_url = str(row_clean.get('day', '')).strip()
+        week_url = str(row_clean.get('week', '')).strip()
 
-        if not symbol or "tradingview.com" not in day_url:
+        if not symbol or not day_url or not week_url:
             with progress_lock: skipped_bad_row += 1
             write_checkpoint(i)
             return
@@ -254,20 +256,23 @@ def process_row(task):
             return
 
         driver = ensure_thread_driver_logged_in()
-        driver.get(day_url)
-        
-        # We will process these two timeframes for every symbol
-        timeframes = [("day", "D"), ("week", "W")]
-        
-        for tf_label, tf_key in timeframes:
-            log(f"🚀 ROW#{i} | {symbol} | {tf_label.upper()} | Date: {target_date}")
+
+        # ✅ List of tasks for this specific row
+        timeframe_tasks = [
+            ("day", day_url, "1D"),
+            ("week", week_url, "1W")
+        ]
+
+        for tf_label, tf_url, tf_key in timeframe_tasks:
+            log(f"🚀 ROW#{i} | {symbol} | Navigating to {tf_label.upper()} URL")
+            driver.get(tf_url)
             
             chart = wait_chart_ready(driver)
             force_clear_ads(driver)
-            
-            # Switch timeframe
-            change_timeframe(driver, tf_key)
-            
+
+            # Force timeframe via keyboard to be 100% sure
+            force_timeframe(driver, tf_key)
+
             # Go to specific date
             goto_date_fast(driver, chart, target_date)
             
@@ -277,7 +282,7 @@ def process_row(task):
             wait_chart_stable_for_screenshot(driver, chart)
             img = chart.screenshot_as_png
 
-            # Save
+            # Save to DB
             month_val = "Unknown"
             try: month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
             except: pass
@@ -292,7 +297,6 @@ def process_row(task):
 
     except Exception as e:
         log(f"🔥 ERROR row#{i}: {safe_str(e)}")
-        with progress_lock: selenium_fail += 1
         write_checkpoint(i)
 
 def main():
