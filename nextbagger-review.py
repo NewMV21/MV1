@@ -25,41 +25,24 @@ DATE_COL_LETTER = "CD"
 TARGET_TABLE = "next_bagger_review_screenshot"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
-SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
-CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_nextbagger.txt")
 
-progress_lock = threading.Lock()
-processed_count = 0
 db_pool = None
 thread_local = threading.local()
-drivers_lock = threading.Lock()
-all_drivers = []
 DATE_MAP = {}
-
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME"),
-    "port": int(os.getenv("DB_PORT", "3306")),
-}
 
 # ---------------- HELPERS ---------------- #
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def col_letter_to_index(letter):
-    letter = letter.upper()
     n = 0
-    for ch in letter:
+    for ch in letter.upper():
         n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
 def normalize_date(val):
     if not val: return ""
-    s = str(val).strip()
-    s = re.sub(r"[^\d/\-]", "", s)
+    s = re.sub(r"[^\d/\-]", "", str(val))
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
@@ -67,22 +50,7 @@ def normalize_date(val):
             pass
     return ""
 
-def write_checkpoint(i):
-    try:
-        with open(CHECKPOINT_FILE, "w") as f:
-            f.write(str(i))
-    except:
-        pass
-
-def read_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            return int(open(CHECKPOINT_FILE).read().strip())
-    except:
-        pass
-    return -1
-
-# ---------------- LOAD DATE MAP ---------------- #
+# ---------------- DATE MAP ---------------- #
 def load_date_map(gc):
     global DATE_MAP
 
@@ -106,7 +74,11 @@ def init_db_pool():
     db_pool = mysql.connector.pooling.MySQLConnectionPool(
         pool_name="pool",
         pool_size=max(2, MAX_THREADS),
-        **DB_CONFIG
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        port=int(os.getenv("DB_PORT", "3306"))
     )
 
 def save_to_mysql(symbol, image, date):
@@ -123,12 +95,20 @@ def save_to_mysql(symbol, image, date):
         conn.commit()
         cursor.close()
         conn.close()
+
     except Exception as e:
         log(f"DB Error: {e}")
 
-# ---------------- BROWSER ---------------- #
+# ---------------- BROWSER FIX ---------------- #
 def get_driver():
     opts = Options()
+
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if not os.path.exists(chrome_bin):
+        chrome_bin = "/usr/bin/chromium"
+
+    opts.binary_location = chrome_bin
+
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -143,6 +123,7 @@ def ensure_logged_in():
 
         d.get("https://www.tradingview.com/chart/")
         cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
+
         for c in cookies:
             d.add_cookie({
                 "name": c["name"],
@@ -150,6 +131,7 @@ def ensure_logged_in():
                 "domain": ".tradingview.com",
                 "path": "/"
             })
+
         d.refresh()
 
     return thread_local.driver
@@ -157,7 +139,6 @@ def ensure_logged_in():
 # ---------------- WORKER ---------------- #
 def process_row(task):
     i, row = task
-
     values = list(row.values())
 
     if len(values) < 4:
@@ -193,12 +174,9 @@ def process_row(task):
         time.sleep(2)
 
         img = chart.screenshot_as_png
-
         save_to_mysql(symbol, img, target_date)
 
         log(f"✅ Captured {symbol}")
-
-        write_checkpoint(i)
 
     except Exception as e:
         log(f"❌ Error {symbol}: {e}")
@@ -216,8 +194,7 @@ def main():
 
     rows = pd.DataFrame(values[1:], columns=values[0]).to_dict("records")
 
-    start = read_checkpoint() + 1
-    tasks = [(i, r) for i, r in enumerate(rows) if i >= start]
+    tasks = list(enumerate(rows))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         executor.map(process_row, tasks)
