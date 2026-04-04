@@ -16,12 +16,14 @@ import threading
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
 
+# ✅ Only date comes from MV sheet
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
-TARGET_TABLE = "next_bagger_review_screenshot"
+# ✅ target table
+TARGET_TABLE = "next_bagger_review_screenshot"  # IMPORTANT
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 
@@ -34,6 +36,7 @@ progress_lock = threading.Lock()
 processed_count = 0
 total_rows = 0
 
+# counters
 skipped_no_date = 0
 skipped_bad_row = 0
 db_ok = 0
@@ -54,209 +57,519 @@ thread_local = threading.local()
 drivers_lock = threading.Lock()
 all_drivers = []
 
-DATE_MAP = {}
+DATE_MAP = {}  # symbol -> yyyy-mm-dd
+
 
 # ---------------- HELPERS ---------------- #
-def log(msg): print(msg, flush=True)
+def log(msg):
+    print(msg, flush=True)
 
 def safe_str(e, n=260):
-    try: return str(e).replace("\n", " ")[:n]
-    except: return "error"
+    try:
+        return str(e).replace("\n", " ")[:n]
+    except:
+        return "error"
 
-def col_letter_to_index(letter):
-    n=0
-    for ch in letter.upper():
-        if "A"<=ch<="Z": n=n*26+(ord(ch)-64)
-    return n-1
+def col_letter_to_index(letter: str) -> int:
+    letter = letter.strip().upper()
+    n = 0
+    for ch in letter:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
 
-def normalize_date(val):
-    if not val: return ""
-    s=re.sub(r"[^\d/\-]","",str(val))
-    for fmt in ("%Y-%m-%d","%d-%m-%Y","%d/%m/%Y","%Y/%m/%d"):
-        try: return datetime.strptime(s,fmt).strftime("%Y-%m-%d")
-        except: pass
+def normalize_date(val: str) -> str:
+    if not val:
+        return ""
+    s = str(val).strip()
+    s = re.sub(r"[^\d/\-]", "", s)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except:
+            pass
     return ""
+
+def preflight_env_check():
+    required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "GSPREAD_CREDENTIALS", "TRADINGVIEW_COOKIES"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        log(f"❌ PRECHECK: Missing env vars: {missing}")
+        return False
+    log("✅ PRECHECK: Env vars present")
+    return True
 
 def read_checkpoint():
     try:
         if os.path.exists(CHECKPOINT_FILE):
-            return int(open(CHECKPOINT_FILE).read().strip())
-    except: pass
+            v = int(open(CHECKPOINT_FILE, "r").read().strip())
+            return max(v, -1)
+    except:
+        pass
     return -1
 
 def write_checkpoint(i):
-    try: open(CHECKPOINT_FILE,"w").write(str(i))
-    except: pass
+    try:
+        with open(CHECKPOINT_FILE, "w") as f:
+            f.write(str(i))
+    except:
+        pass
+
 
 # ---------------- DATE MAP ---------------- #
 def load_date_map(gc):
     global DATE_MAP
+    DATE_MAP = {}
+
+    sym_i = col_letter_to_index(DATE_SYMBOL_COL)
+    date_i = col_letter_to_index(DATE_COL_LETTER)
+
     ss = gc.open(DATE_SPREADSHEET_NAME)
     ws = ss.worksheet(DATE_TAB_NAME)
-    vals = ws.get_all_values()
+    values = ws.get_all_values()
 
-    si = col_letter_to_index(DATE_SYMBOL_COL)
-    di = col_letter_to_index(DATE_COL_LETTER)
+    for r in values:
+        if len(r) <= max(sym_i, date_i):
+            continue
+        sym = str(r[sym_i]).strip()
+        dt = normalize_date(r[date_i])
+        if sym and dt:
+            DATE_MAP[sym.upper()] = dt
 
-    for r in vals:
-        if len(r)>max(si,di):
-            sym=r[si].strip()
-            dt=normalize_date(r[di])
-            if sym and dt:
-                DATE_MAP[sym.upper()] = dt
+    log(f"✅ CHECKPOINT: DATE_MAP loaded = {len(DATE_MAP)} from {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} (Symbol {DATE_SYMBOL_COL}, Date {DATE_COL_LETTER})")
+    log(f"✅ CHECKPOINT: DATE_MAP sample = {list(DATE_MAP.items())[:5]}")
 
-    log(f"✅ DATE MAP loaded: {len(DATE_MAP)}")
 
 # ---------------- DB ---------------- #
+def db_network_diagnostics():
+    host = DB_CONFIG.get("host")
+    port = DB_CONFIG.get("port", 3306)
+    try:
+        ip = socket.gethostbyname(host)
+        log(f"✅ CHECKPOINT: DB_HOST resolves {host} -> {ip}:{port}")
+    except Exception as e:
+        log(f"⚠️ CHECKPOINT: DNS resolve failed for {host}: {safe_str(e)}")
+
 def init_db_pool():
     global db_pool
-    db_pool = mysql.connector.pooling.MySQLConnectionPool(
-        pool_name="pool",
-        pool_size=max(2,MAX_THREADS),
-        **DB_CONFIG
-    )
 
-def save_to_mysql(symbol,timeframe,img,date,month):
+    db_network_diagnostics()
+
+    # 1) Direct connect test (proves real reason)
     try:
-        conn=db_pool.get_connection()
-        cur=conn.cursor()
-
-        cur.execute(f"""
-        INSERT INTO {TARGET_TABLE} (symbol,timeframe,screenshot,chart_date,month_before)
-        VALUES (%s,%s,%s,%s,%s)
-        ON DUPLICATE KEY UPDATE
-        screenshot=VALUES(screenshot),
-        chart_date=VALUES(chart_date),
-        month_before=VALUES(month_before),
-        created_at=CURRENT_TIMESTAMP
-        """,(symbol,timeframe,img,date,month))
-
-        conn.commit()
+        log("🔎 CHECKPOINT: Direct connect test (no pool)...")
+        c = mysql.connector.connect(**DB_CONFIG)
+        cur = c.cursor()
+        cur.execute("SELECT DATABASE()")
+        dbname = cur.fetchone()[0]
         cur.close()
+        c.close()
+        log(f"✅ CHECKPOINT: Direct connect OK (db={dbname})")
+    except Exception as e:
+        log(f"❌ CHECKPOINT: Direct connect FAILED: {repr(e)}")
+        return False
+
+    # 2) Pool with retries (Hostinger sometimes unstable)
+    for attempt in range(1, 6):
+        try:
+            log(f"📡 CHECKPOINT: Connecting to Database pool... attempt={attempt}/5")
+            db_pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="screenshot_pool",
+                pool_size=max(2, MAX_THREADS),
+                pool_reset_session=True,
+                **DB_CONFIG
+            )
+            t = db_pool.get_connection()
+            t.close()
+            log("✅ CHECKPOINT: DATABASE POOL CONNECTION SUCCESSFUL")
+            return True
+        except Exception as e:
+            log(f"❌ CHECKPOINT: POOL CONNECT FAILED attempt {attempt}: {repr(e)}")
+            time.sleep(6)
+
+    return False
+
+def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
+    if db_pool is None:
+        return False
+    try:
+        conn = db_pool.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT DATABASE()")
+        current_db = cursor.fetchone()[0]
+
+        query = f"""
+            INSERT INTO {TARGET_TABLE} (symbol, timeframe, screenshot, chart_date, month_before)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                screenshot = VALUES(screenshot),
+                chart_date = VALUES(chart_date),
+                month_before = VALUES(month_before),
+                created_at = CURRENT_TIMESTAMP
+        """
+        cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
+        conn.commit()
+
+        cursor.execute(f"SELECT COUNT(*) FROM {TARGET_TABLE}")
+        total = cursor.fetchone()[0]
+
+        log(f"✅ DB CONFIRM: host={DB_CONFIG['host']} db={current_db} table={TARGET_TABLE} total_rows_now={total}")
+
+        cursor.close()
         conn.close()
         return True
-    except Exception as e:
-        log(f"❌ DB ERROR {symbol}: {safe_str(e)}")
+    except Exception as err:
+        log(f"    ❌ DB SAVE ERROR [{symbol}]: {repr(err)}")
         return False
+
 
 # ---------------- BROWSER ---------------- #
 def get_driver():
-    opts=Options()
-    opts.binary_location="/usr/bin/chromium"
+    opts = Options()
+
+    # ✅ Chromium binary fix (GitHub runner)
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if not os.path.exists(chrome_bin):
+        chrome_bin = "/usr/bin/chromium"
+    opts.binary_location = chrome_bin
+    log(f"✅ CHECKPOINT: Using Chrome binary = {chrome_bin}")
+
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1600,900")
-    return webdriver.Chrome(options=opts)
 
-def ensure_driver():
-    if not getattr(thread_local,"driver",None):
-        d=get_driver()
-        thread_local.driver=d
-        d.get("https://www.tradingview.com/chart/")
-    return thread_local.driver
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter")
+    opts.add_argument("--mute-audio")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
 
-def wait_chart(driver):
-    WebDriverWait(driver,20).until(
-        lambda d: d.execute_script("return document.readyState")=="complete")
-    return WebDriverWait(driver,20).until(
-        EC.presence_of_element_located((By.XPATH,"//div[contains(@class,'chart-container')]")))
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    opts.add_experimental_option("prefs", prefs)
 
-def goto_date(driver,chart,date):
-    ActionChains(driver).move_to_element(chart).click().perform()
-    ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
-    box=WebDriverWait(driver,10).until(
-        EC.visibility_of_element_located((By.XPATH,"//input")))
-    box.send_keys(Keys.CONTROL,"a")
-    box.send_keys(date)
-    box.send_keys(Keys.ENTER)
-    time.sleep(1)
+    d = webdriver.Chrome(options=opts)
+    d.set_page_load_timeout(45)
+    d.implicitly_wait(0)
+    return d
 
-def stable(chart):
-    last=None
-    for _ in range(6):
-        h=hashlib.md5(chart.screenshot_as_png).hexdigest()
-        if h==last: return True
-        last=h
-        time.sleep(0.4)
+def kill_thread_driver():
+    try:
+        d = getattr(thread_local, "driver", None)
+        if d:
+            d.quit()
+    except:
+        pass
+    thread_local.driver = None
+
+def force_clear_ads(driver):
+    try:
+        driver.execute_script("""
+            const selectors = [
+                "div[class*='overlap-manager']",
+                "div[id*='overlap-manager']",
+                "div[class*='dialog-']",
+                "div[class*='popup-']",
+                "div[class*='drawer-']",
+                "div[class*='notification-']",
+                "[data-role='toast-container']",
+                "[role='dialog']"
+            ];
+            selectors.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => el.remove());
+            });
+        """)
+    except:
+        pass
+
+def wait_chart_ready(driver, timeout=20):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+    )
+    return WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
+    )
+
+# ✅ NEW: waits just enough so indicators finish drawing (fast on already-loaded charts)
+def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=6.0):
+    """
+    Goal: avoid screenshot before indicators load.
+    Fast path: if already stable, returns quickly (usually < 0.8s).
+    Strategy:
+      1) wait until typical loading spinners/progress are gone (best-effort)
+      2) require 2 consecutive identical chart element screenshots (hash-based)
+    """
+    end = time.time() + max_wait
+
+    def has_loading():
+        try:
+            return driver.execute_script("""
+                const sels = [
+                  "[data-name='spinner']",
+                  "[class*='spinner']",
+                  "[class*='loading']",
+                  "[class*='progress']",
+                  "div[class*='loader']"
+                ];
+                for (const s of sels) {
+                  const el = document.querySelector(s);
+                  if (el && el.offsetParent !== null) return true;
+                }
+                return false;
+            """)
+        except:
+            return False
+
+    # (1) brief wait for loaders to disappear (doesn't block long)
+    while time.time() < end and has_loading():
+        time.sleep(0.25)
+
+    # (2) stability via element screenshot hash
+    last_h = None
+    stable_hits = 0
+    while time.time() < end:
+        try:
+            png = chart_el.screenshot_as_png
+            h = hashlib.md5(png).hexdigest()
+        except:
+            # if element reference became stale, caller will re-find chart
+            return False
+
+        if h == last_h:
+            stable_hits += 1
+            if stable_hits >= 2:
+                return True
+        else:
+            stable_hits = 0
+            last_h = h
+
+        time.sleep(0.35)
+
+    # if time runs out, still return True-ish (we tried); caller can proceed
     return True
 
-def capture(driver,url,symbol,date):
-    try:
-        driver.get(url)
-        chart=wait_chart(driver)
-        goto_date(driver,chart,date)
-        chart=wait_chart(driver)
-        stable(chart)
-        return chart.screenshot_as_png
-    except Exception as e:
-        log(f"⚠️ CAPTURE FAIL {symbol}: {safe_str(e)}")
-        return None
+def ensure_thread_driver_logged_in():
+    if getattr(thread_local, "driver", None) is None:
+        d = get_driver()
+        thread_local.driver = d
+        with drivers_lock:
+            all_drivers.append(d)
+
+        d.get("https://www.tradingview.com/chart/")
+
+        cookie_data = os.getenv("TRADINGVIEW_COOKIES")
+        if cookie_data:
+            try:
+                cookies = json.loads(cookie_data)
+                for c in cookies:
+                    d.add_cookie({
+                        "name": c.get("name"),
+                        "value": c.get("value"),
+                        "domain": ".tradingview.com",
+                        "path": "/"
+                    })
+                d.refresh()
+                log("✅ CHECKPOINT: Cookies injected and refreshed")
+            except Exception as e:
+                log(f"⚠️ CHECKPOINT: Cookie load failed: {safe_str(e)}")
+
+    return thread_local.driver
+
+def goto_date_fast(driver, chart_el, target_date):
+    ActionChains(driver).move_to_element(chart_el).click().perform()
+    time.sleep(0.2)
+
+    ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
+
+    input_xpath = "//input[contains(@class,'query') or @data-role='search' or contains(@class,'input')]"
+    w = WebDriverWait(driver, 12)
+    box = w.until(EC.visibility_of_element_located((By.XPATH, input_xpath)))
+
+    box.send_keys(Keys.CONTROL, "a")
+    box.send_keys(Keys.BACKSPACE)
+    box.send_keys(target_date)
+    box.send_keys(Keys.ENTER)
+
+    time.sleep(0.8)
+    force_clear_ads(driver)
+    time.sleep(0.6)
+    force_clear_ads(driver)
+
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
-    global processed_count, db_ok, db_fail
+    global processed_count, skipped_no_date, skipped_bad_row, db_ok, db_fail, selenium_fail
 
-    i,row=task
-    row={k.lower():v for k,v in row.items()}
+    i, row = task
 
-    symbol=row.get("symbol","").strip()
-    day=row.get("day","").strip()
-    week=row.get("week","").strip()
+    try:
+        row_clean = {str(k).lower().strip(): v for k, v in row.items()}
+        symbol = str(row_clean.get('symbol', '')).strip()
+        day_url = str(row_clean.get('day', '')).strip()
 
-    if not symbol:
-        write_checkpoint(i); return
+        if not symbol or "tradingview.com" not in day_url:
+            with progress_lock:
+                skipped_bad_row += 1
+            log(f"⏭️ SKIP row#{i}: bad row (symbol/url missing) symbol='{symbol}' url='{day_url}'")
+            write_checkpoint(i)
+            return
 
-    date=DATE_MAP.get(symbol.upper(),"")
-    if not date:
-        write_checkpoint(i); return
+        target_date = DATE_MAP.get(symbol.upper(), "")
+        if not target_date:
+            with progress_lock:
+                skipped_no_date += 1
+            log(f"⏭️ SKIP row#{i}: {symbol} -> NO DATE in {DATE_SPREADSHEET_NAME}/{DATE_TAB_NAME} col {DATE_COL_LETTER}")
+            write_checkpoint(i)
+            return
 
-    driver=ensure_driver()
+        with progress_lock:
+            processed_count += 1
+            current_idx = processed_count
 
-    day_img = capture(driver,day,symbol,date) if "tradingview" in day else None
-    week_img = capture(driver,week,symbol,date) if "tradingview" in week else None
+        log(f"🚀 START row#{i} [{current_idx}/{total_rows}] {symbol} | date={target_date}")
 
-    month="Unknown"
-    try: month=datetime.strptime(date,"%Y-%m-%d").strftime("%B")
-    except: pass
+        try:
+            driver = ensure_thread_driver_logged_in()
 
-    ok=True
-    if day_img:
-        if not save_to_mysql(symbol,"day",day_img,date,month): ok=False
-    if week_img:
-        if not save_to_mysql(symbol,"week",week_img,date,month): ok=False
+            log(f"   🌐 GET: {symbol}")
+            driver.get(day_url)
 
-    if ok: db_ok+=1
-    else: db_fail+=1
+            log(f"   📈 WAIT CHART: {symbol}")
+            chart = wait_chart_ready(driver, timeout=20)
+            force_clear_ads(driver)
 
-    write_checkpoint(i)
+            log(f"   🗓️ GOTO DATE: {symbol} -> {target_date}")
+            goto_date_fast(driver, chart, target_date)
+
+            # ✅ UPDATED: wait for indicators to fully draw, but keep it fast
+            log(f"   ⏳ STABILIZE: {symbol} (fast wait for indicators)")
+            chart = wait_chart_ready(driver, timeout=15)  # re-grab
+            force_clear_ads(driver)
+            wait_chart_stable_for_screenshot(driver, chart, max_wait=6.0)
+
+            log(f"   📸 SCREENSHOT: {symbol}")
+            # one last re-grab (handles rare DOM refresh)
+            chart = wait_chart_ready(driver, timeout=10)
+            force_clear_ads(driver)
+            img = chart.screenshot_as_png
+
+        except Exception as se:
+            with progress_lock:
+                selenium_fail += 1
+                db_fail += 1
+            log(f"⚠️ SELENIUM ERROR row#{i}: {symbol} -> {safe_str(se)}")
+            kill_thread_driver()
+            write_checkpoint(i)
+            return
+
+        month_val = "Unknown"
+        try:
+            month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
+        except:
+            pass
+
+        ok = save_to_mysql(symbol, "day", img, target_date, month_val)
+        with progress_lock:
+            if ok:
+                db_ok += 1
+            else:
+                db_fail += 1
+
+        if ok:
+            log(f"✅ DB OK row#{i}: inserted/updated {symbol} ({target_date}) -> {TARGET_TABLE}")
+        else:
+            log(f"❌ DB FAIL row#{i}: {symbol} ({target_date}) -> {TARGET_TABLE}")
+
+        write_checkpoint(i)
+
+    except Exception as e:
+        with progress_lock:
+            db_fail += 1
+        log(f"🔥 FATAL ROW ERROR row#{i}: {safe_str(e)}")
+        write_checkpoint(i)
+        return
+
 
 # ---------------- MAIN ---------------- #
 def main():
     global total_rows
 
-    creds=json.loads(os.getenv("GSPREAD_CREDENTIALS"))
-    gc=gspread.service_account_from_dict(creds)
+    log("🏁 CHECKPOINT: Script started")
+    log(f"✅ CHECKPOINT: Target table = {TARGET_TABLE}")
 
-    load_date_map(gc)
+    if not preflight_env_check():
+        return
 
-    ws=gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
-    vals=ws.get_all_values()
+    if not init_db_pool():
+        return
 
-    df=pd.DataFrame(vals[1:],columns=vals[0])
-    rows=df.to_dict("records")
+    try:
+        creds = json.loads(os.getenv("GSPREAD_CREDENTIALS"))
+        gc = gspread.service_account_from_dict(creds)
+        log("✅ CHECKPOINT: Google credentials loaded")
 
-    last=read_checkpoint()
-    rows=list(enumerate(rows))[last+1:]
+        load_date_map(gc)
 
-    total_rows=len(rows)
+        spreadsheet = gc.open(SPREADSHEET_NAME)
+        worksheet = spreadsheet.worksheet(TAB_NAME)
+        all_values = worksheet.get_all_values()
 
-    init_db_pool()
+        headers = [h.strip() for h in all_values[0]]
+        df = pd.DataFrame(all_values[1:], columns=headers)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        rows = df.to_dict("records")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
-        ex.map(process_row, rows)
+        if SHARD_STEP > 1:
+            rows = [r for idx, r in enumerate(rows) if (idx % SHARD_STEP) == SHARD_INDEX]
 
-    log(f"✅ DONE: {db_ok} success | {db_fail} fail")
+        last_done = read_checkpoint()
+        start_from = last_done + 1
 
-if __name__=="__main__":
+        rows_indexed = list(enumerate(rows))
+        rows_indexed = [t for t in rows_indexed if t[0] >= start_from]
+
+        total_rows = len(rows_indexed)
+
+        log(f"✅ CHECKPOINT: Main rows loaded = {len(rows)} (raw), to-run = {total_rows} (resume from last_done={last_done})")
+        log(f"✅ CHECKPOINT: Sample main row = {rows[0] if rows else 'EMPTY'}")
+
+    except Exception as e:
+        log(f"❌ CHECKPOINT: GOOGLE SHEETS ERROR: {repr(e)}")
+        return
+
+    if total_rows == 0:
+        log("⚠️ CHECKPOINT: Nothing to process (total_rows=0). Check shard/checkpoint.")
+        return
+
+    log(f"ℹ️ CHECKPOINT: Starting ThreadPool MAX_THREADS={MAX_THREADS}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = [executor.submit(process_row, t) for t in rows_indexed]
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                log(f"🔥 THREAD CRASH: {repr(e)}")
+
+    with drivers_lock:
+        for d in all_drivers:
+            try:
+                d.quit()
+            except:
+                pass
+
+    log("\n🏁 COMPLETED.")
+    log(f"📊 SUMMARY: processed={processed_count}, db_ok={db_ok}, db_fail={db_fail}, selenium_fail={selenium_fail}, skipped_no_date={skipped_no_date}, skipped_bad_row={skipped_bad_row}")
+    log(f"🧾 Checkpoint file used: {CHECKPOINT_FILE}")
+
+
+if __name__ == "__main__":
     main()
