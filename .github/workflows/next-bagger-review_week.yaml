@@ -1,5 +1,5 @@
-name: TradingView NextBagger Review Bot
-
+name: TradingView NextBagger Review Bot WEEK
+ 
 on:
   workflow_dispatch:   # ✅ Manual trigger only
 
