@@ -15,9 +15,9 @@ import threading
 # ---------------- CONFIG ---------------- #
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
-DAY_URL_COLUMN_NAME = "Day"  # ✅ Updated to your new column name
+DAY_URL_COLUMN_NAME = "Day" 
 
-# ✅ Date Source Config (Updated to sheet2 and Col CD)
+# ✅ Date Source Config
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
@@ -33,7 +33,6 @@ CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_nextbagger.txt")
 
 progress_lock = threading.Lock()
 processed_count = 0
-total_rows = 0
 db_ok = 0
 db_fail = 0
 
@@ -43,7 +42,7 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD"),
     "database": os.getenv("DB_NAME"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "connect_timeout": 15,
+    "connect_timeout": 20,
 }
 
 db_pool = None
@@ -54,7 +53,7 @@ DATE_MAP = {}
 
 # ---------------- HELPERS ---------------- #
 def log(msg):
-    print(msg, flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def col_letter_to_index(letter: str) -> int:
     letter = letter.strip().upper()
@@ -79,7 +78,9 @@ def write_checkpoint(i):
 
 def read_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
-        try: return int(open(CHECKPOINT_FILE, "r").read().strip())
+        try: 
+            with open(CHECKPOINT_FILE, "r") as f:
+                return int(f.read().strip())
         except: return -1
     return -1
 
@@ -87,7 +88,8 @@ def read_checkpoint():
 def load_date_map(gc):
     global DATE_MAP
     DATE_MAP = {}
-    ws = gc.open(DATE_SPREADSHEET_NAME).worksheet(DATE_TAB_NAME)
+    ss = gc.open(DATE_SPREADSHEET_NAME)
+    ws = ss.worksheet(DATE_TAB_NAME)
     values = ws.get_all_values()
     sym_i = col_letter_to_index(DATE_SYMBOL_COL)
     date_i = col_letter_to_index(DATE_COL_LETTER)
@@ -97,13 +99,13 @@ def load_date_map(gc):
             sym = str(r[sym_i]).strip().upper()
             dt = normalize_date(r[date_i])
             if sym and dt: DATE_MAP[sym] = dt
-    log(f"✅ DATE_MAP: Loaded {len(DATE_MAP)} symbols from {DATE_TAB_NAME} (Col {DATE_COL_LETTER})")
+    log(f"✅ DATE_MAP: Loaded {len(DATE_MAP)} symbols from {DATE_TAB_NAME}")
 
 def init_db_pool():
     global db_pool
     try:
         db_pool = mysql.connector.pooling.MySQLConnectionPool(
-            pool_name="screenshot_pool", pool_size=max(2, MAX_THREADS + 1), **DB_CONFIG
+            pool_name="screenshot_pool", pool_size=MAX_THREADS + 2, **DB_CONFIG
         )
         return True
     except Exception as e:
@@ -139,15 +141,20 @@ def get_driver():
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1600,900")
+    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if os.path.exists(chrome_bin):
+        opts.binary_location = chrome_bin
+        
     d = webdriver.Chrome(options=opts)
+    d.set_page_load_timeout(60)
     return d
 
 def process_row(task):
     global processed_count, db_ok, db_fail
     i, row = task
-    # Clean keys to match column name exactly
     row_clean = {str(k).strip(): v for k, v in row.items()}
     symbol = str(row_clean.get('symbol', '')).strip()
     day_url = str(row_clean.get(DAY_URL_COLUMN_NAME, '')).strip()
@@ -158,64 +165,97 @@ def process_row(task):
         return
 
     try:
-        if not hasattr(thread_local, "driver"):
+        if not hasattr(thread_local, "driver") or thread_local.driver is None:
+            log(f"🌐 Initializing Driver for Thread...")
             thread_local.driver = get_driver()
             with drivers_lock: all_drivers.append(thread_local.driver)
-            # Inject cookies for login session
             thread_local.driver.get("https://www.tradingview.com/")
             cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
-            for c in cookies: thread_local.driver.add_cookie(c)
+            for c in cookies: 
+                try: thread_local.driver.add_cookie(c)
+                except: pass
+            thread_local.driver.refresh()
 
         d = thread_local.driver
         d.get(day_url)
         
-        # Wait for chart
-        wait = WebDriverWait(d, 20)
+        wait = WebDriverWait(d, 30)
         chart = wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]")))
         
-        # Go to date
+        # Open 'Go To' Dialog
         ActionChains(d).move_to_element(chart).click().perform()
-        time.sleep(0.5)
+        time.sleep(1)
         ActionChains(d).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
+        
+        # Enter Date
         box = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[contains(@class,'input')]")))
         box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
         box.send_keys(target_date, Keys.ENTER)
         
-        time.sleep(4) # Wait for indicators to load
+        # Wait for data to render
+        time.sleep(6) 
+        
+        # Force a quick check for popups/ads that might block screenshot
+        try:
+            d.execute_script("document.querySelectorAll('.overlap-manager-root, .tv-dialog__close').forEach(el => el.remove());")
+        except: pass
+
         img = chart.screenshot_as_png
         month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
 
         if save_to_mysql(symbol, "day", img, target_date, month_val):
-            with progress_lock: db_ok += 1
-            log(f"✅ row#{i} {symbol} Saved")
+            with progress_lock: 
+                db_ok += 1
+                processed_count += 1
+            log(f"✅ [{processed_count}] Saved {symbol} ({target_date})")
         else:
             with progress_lock: db_fail += 1
             
         write_checkpoint(i)
+
     except Exception as e:
-        log(f"🔥 row#{i} Error: {str(e)[:100]}")
+        log(f"🔥 Error row#{i} {symbol}: {str(e)[:150]}")
+        # If driver crashes, clear it so next task restarts it
+        try: thread_local.driver.quit()
+        except: pass
+        thread_local.driver = None
+        write_checkpoint(i)
 
 def main():
     if not init_db_pool(): return
-    creds = json.loads(os.getenv("GSPREAD_CREDENTIALS"))
-    gc = gspread.service_account_from_dict(creds)
-    load_date_map(gc)
+    try:
+        creds_json = os.getenv("GSPREAD_CREDENTIALS")
+        creds = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds)
+        load_date_map(gc)
 
-    ws = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
-    all_rows = ws.get_all_records()
-    
-    # Resuming and Sharding logic
-    start_idx = read_checkpoint() + 1
-    tasks = [(idx, r) for idx, r in enumerate(all_rows) if idx >= start_idx]
-    if SHARD_STEP > 1:
-        tasks = [t for t in tasks if (t[0] % SHARD_STEP) == SHARD_INDEX]
+        ws = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
+        all_rows = ws.get_all_records()
+        
+        last_idx = read_checkpoint()
+        start_idx = last_idx + 1
+        
+        # Filter for shard and progress
+        tasks = []
+        for idx, r in enumerate(all_rows):
+            if idx >= start_idx:
+                if (idx % SHARD_STEP) == SHARD_INDEX:
+                    tasks.append((idx, r))
 
-    log(f"🚀 Starting processing {len(tasks)} tasks...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        list(executor.map(process_row, tasks))
+        log(f"🚀 Processing {len(tasks)} symbols (Resuming from {start_idx})")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            executor.map(process_row, tasks)
 
-    for d in all_drivers: d.quit()
-    log("🏁 Done.")
+    except Exception as e:
+        log(f"❌ Fatal Error: {e}")
+    finally:
+        with drivers_lock:
+            for d in all_drivers: 
+                try: d.quit()
+                except: pass
+        log(f"📊 Final Stats: Success={db_ok}, Fail={db_fail}")
+        log("🏁 Done.")
 
 if __name__ == "__main__":
     main()
