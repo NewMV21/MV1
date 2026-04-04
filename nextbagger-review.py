@@ -18,8 +18,8 @@ TAB_NAME = "Weekday"
 
 # ✅ Only date comes from MV sheet
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
-DATE_TAB_NAME = "Sheet15"
-DATE_COL_LETTER = "Z"
+DATE_TAB_NAME = "Sheet12"
+DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
 # ✅ target table
