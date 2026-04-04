@@ -195,7 +195,7 @@ def process_row(task):
         )
 
         # Final buffer for candle render
-        time.sleep(2.5)
+        time.sleep(6)
 
         # ---------------- SMART WAIT END ---------------- #
 
