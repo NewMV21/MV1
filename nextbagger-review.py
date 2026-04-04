@@ -203,7 +203,7 @@ def process_row(task):
     global processed_count
     i, row = task
     symbol = str(row.get('symbol', '')).strip()
-    day_url = str(row.get('day', '')).strip()
+    day_url = str(row.get('Day', '')).strip()
     target_date = DATE_MAP.get(symbol.upper())
 
     if not symbol or "tradingview" not in day_url or not target_date:
