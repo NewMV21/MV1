@@ -16,8 +16,8 @@ import threading
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
-DATE_TAB_NAME = "Sheet15"
-DATE_COL_LETTER = "Z"
+DATE_TAB_NAME = "Sheet2"
+DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 TARGET_TABLE = "next_bagger_review_screenshot" 
 
