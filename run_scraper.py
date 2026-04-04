@@ -1,383 +1,250 @@
-import os, time, json, gspread
-from datetime import date
+import os, time, json, gspread, concurrent.futures, re, socket, hashlib
+import pandas as pd
+import mysql.connector
+from mysql.connector import pooling
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from datetime import datetime
+import threading
 
 # ---------------- CONFIG ---------------- #
-STOCK_LIST_URL = "https://docs.google.com/spreadsheets/d/1V8DsH-R3vdUbXqDKZYWHk_8T0VRjqTEVyj7PhlIDtG4/edit?gid=0#gid=0"
-NEW_MV2_URL    = "https://docs.google.com/spreadsheets/d/1GKlzomaK4l_Yh8pzVtzucCogWW5d-ikVeqCxC6gvBuc/edit?gid=0#gid=0"
+SPREADSHEET_NAME = "Stock List"
+TAB_NAME = "Weekday"
+DAY_URL_COLUMN_NAME = "Day" 
 
-# SIMPLE RANGE (REMOVED SHARDING CONFUSION!)
-START_INDEX = int(os.getenv("START_INDEX", "0"))
-END_INDEX   = int(os.getenv("END_INDEX", "2500"))
-CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint.txt")
+# ✅ Date Source (MV2 for SQL)
+DATE_SPREADSHEET_NAME = "MV2 for SQL"
+DATE_TAB_NAME = "Sheet2"
+DATE_COL_LETTER = "CD"
+DATE_SYMBOL_COL = "A"
 
-# Resume from checkpoint
-last_i = START_INDEX
-if os.path.exists(CHECKPOINT_FILE):
-    with open(CHECKPOINT_FILE, "r") as f:
-        try:
-            last_i = int(f.read().strip())
-        except:
-            pass
+TARGET_TABLE = "next_bagger_review_screenshot"
 
-print(f"🔧 Range: {START_INDEX}-{END_INDEX} | Resume: {last_i}")
+MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
+SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_nextbagger.txt")
 
-# ---------------- GOOGLE SHEETS AUTH ---------------- #
-try:
-    creds_json = os.getenv("GSPREAD_CREDENTIALS")
-    if creds_json:
-        client = gspread.service_account_from_dict(json.loads(creds_json))
-    else:
-        client = gspread.service_account(filename="credentials.json")
-        
-    source_sheet = client.open_by_url(STOCK_LIST_URL).worksheet("Sheet1")
-    dest_sheet   = client.open_by_url(NEW_MV2_URL).worksheet("Sheet5")
-    data_rows = source_sheet.get_all_values()[1:]  # Skip header
-    print("✅ Connected. Reading Sheet1, Writing Sheet5")
-except Exception as e:
-    print(f"❌ Connection Error: {e}")
-    raise
+BROWSER_RESTART_LIMIT = 40 
 
-current_date = date.today().strftime("%m/%d/%Y")
-CHROME_SERVICE = Service(ChromeDriverManager().install())
+progress_lock = threading.Lock()
+processed_count = 0
+db_ok = 0
+db_fail = 0
+skipped_no_date = 0
 
-# ---------------- YOUR PROVEN SCRAPER (EXACT!) ---------------- #
-def scrape_tradingview(url):
-    if not url:
-        return []
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+    "port": int(os.getenv("DB_PORT", "3306")),
+    "connect_timeout": 30,
+}
 
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    
-    # YOUR STEALTH OPTIONS (EXACT)
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+db_pool = None
+thread_local = threading.local()
+drivers_lock = threading.Lock()
+all_drivers = []
+DATE_MAP = {}
 
-    driver = webdriver.Chrome(service=CHROME_SERVICE, options=opts)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+# ---------------- HELPERS ---------------- #
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def col_letter_to_index(letter: str) -> int:
+    n = 0
+    for ch in letter.strip().upper():
+        if "A" <= ch <= "Z": n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
+
+def normalize_date(val: str) -> str:
+    if not val: return ""
+    s = re.sub(r"[^\d/\-]", "", str(val).strip())
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try: return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except: pass
+    return ""
+
+def write_checkpoint(i):
     try:
-        # YOUR COOKIES LOGIC (EXACT)
-        if os.path.exists("cookies.json"):
-            driver.get("https://www.tradingview.com/")
-            with open("cookies.json", "r") as f:
-                for c in json.load(f):
-                    try:
-                        driver.add_cookie({
-                            "name": c.get("name"),
-                            "value": c.get("value"),
-                            "domain": c.get("domain", ".tradingview.com"),
-                            "path": c.get("path", "/")
-                        })
-                    except:
-                        pass
-            driver.refresh()
+        with open(CHECKPOINT_FILE, "w") as f: f.write(str(i))
+    except: pass
 
-        driver.get(url)
-        
-        # YOUR PROVEN XPATH (EXACT!)
-        WebDriverWait(driver, 40).until(
-            EC.visibility_of_element_located((
-                By.XPATH,
-                '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
-            ))
+def read_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        try: 
+            with open(CHECKPOINT_FILE, "r") as f:
+                c = f.read().strip()
+                return int(c) if c else -1
+        except: return -1
+    return -1
+
+# ---------------- CORE ---------------- #
+def load_date_map(gc):
+    global DATE_MAP
+    DATE_MAP = {}
+    ws = gc.open(DATE_SPREADSHEET_NAME).worksheet(DATE_TAB_NAME)
+    vals = ws.get_all_values()
+    s_i, d_i = col_letter_to_index(DATE_SYMBOL_COL), col_letter_to_index(DATE_COL_LETTER)
+    for r in vals:
+        if len(r) > max(s_i, d_i):
+            s, d = r[s_i].strip().upper(), normalize_date(r[d_i])
+            if s and d: DATE_MAP[s] = d
+    log(f"✅ DATE_MAP: Loaded {len(DATE_MAP)} valid dates from {DATE_TAB_NAME}")
+
+def init_db_pool():
+    global db_pool
+    try:
+        db_pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="screenshot_pool", pool_size=MAX_THREADS + 2, **DB_CONFIG
         )
-        
-        time.sleep(2)  # YOUR TIMING
-
-        # YOUR EXACT SELECTOR (WORKS!)
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        return [
-            el.get_text()
-              .replace('−', '-')
-              .replace('∅', '')
-              .strip()
-            for el in soup.find_all(
-                "div",
-                class_="valueValue-l31H9iuA apply-common-tooltip"
-            )
-        ]
-
+        return True
     except Exception as e:
-        print(f"⚠️ Scrape Fail: {e}")
-        return []
+        log(f"❌ DB Pool Error: {e}")
+        return False
 
-    finally:
-        driver.quit()
-
-# ---------------- YOUR PROVEN MAIN LOOP ---------------- #
-batch, batch_start = [], None
-
-print(f"\n🚀 Processing Rows {START_INDEX+2}-{END_INDEX+2}")
-
-for i, row in enumerate(data_rows):  # i starts at 0
-    # SIMPLE RANGE (NO SHARDING!)
-    if i < last_i or i < START_INDEX or i > END_INDEX:
-        continue
-
-    name = row[0]
-    url  = row[3] if len(row) > 3 else ""
-    target_row = i + 2  # YOUR PERFECT MAPPING
-
-    if batch_start is None:
-        batch_start = target_row
-
-    print(f"🔎 [{i}] {name} -> Row {target_row}")
-
-    # YOUR PROVEN SCRAPER
-    vals = scrape_tradingview(url)
-    row_data = [name, current_date] + (vals if vals else ["Error"] * 6)
-    batch.append(row_data)
-
-    # YOUR BATCH LOGIC (EXACT)
-    if len(batch) >= 5:
-        try:
-            dest_sheet.update(f"A{batch_start}", batch)
-            print(f"💾 Saved rows {batch_start} to {target_row}")
-            batch, batch_start = [], None
-            time.sleep(2)
-        except Exception as e:
-            print(f"❌ Write Error: {e}")
-
-    # YOUR CHECKPOINT (EXACT)
-    with open(CHECKPOINT_FILE, "w") as f:
-        f.write(str(i + 1))
-
-    time.sleep(1)  # YOUR DELAY
-
-# YOUR FINAL FLUSH (EXACT)
-if batch:
-    dest_sheet.update(f"A{batch_start}", batch)
-
-print("\n🏁 Process finished.")
-import os, time, json, gspread
-from datetime import date
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from bs4 import BeautifulSoup
-from webdriver_manager.chrome import ChromeDriverManager
-import re
-
-# ---------------- CONFIG ---------------- #
-STOCK_LIST_URL = "https://docs.google.com/spreadsheets/d/1V8DsH-R3vdUbXqDKZYWHk_8T0VRjqTEVyj7PhlIDtG4/edit?gid=0#gid=0"
-NEW_MV2_URL    = "https://docs.google.com/spreadsheets/d/1GKlzomaK4l_Yh8pzVtzucCogWW5d-ikVeqCxC6gvBuc/edit?gid=0#gid=0"
-
-START_INDEX = int(os.getenv("START_INDEX", "0"))
-END_INDEX   = int(os.getenv("END_INDEX", "2500"))
-CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint.txt")
-
-# Resume from checkpoint
-last_i = START_INDEX
-if os.path.exists(CHECKPOINT_FILE):
+def save_to_mysql(symbol, timeframe, img, chart_date, month):
     try:
-        with open(CHECKPOINT_FILE, "r") as f:
-            last_i = int(f.read().strip())
-    except:
-        pass
+        conn = db_pool.get_connection()
+        cursor = conn.cursor()
+        query = f"INSERT INTO {TARGET_TABLE} (symbol, timeframe, screenshot, chart_date, month_before) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE screenshot=VALUES(screenshot), chart_date=VALUES(chart_date), month_before=VALUES(month_before)"
+        cursor.execute(query, (symbol, timeframe, img, chart_date, month))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        log(f"    ❌ DB Error {symbol}: {e}")
+        return False
 
-print(f"🔧 Range: {START_INDEX}-{END_INDEX} | Resume: {last_i}")
-
-# ---------------- GOOGLE SHEETS ---------------- #
-try:
-    creds_json = os.getenv("GSPREAD_CREDENTIALS")
-    if creds_json:
-        client = gspread.service_account_from_dict(json.loads(creds_json))
-    else:
-        client = gspread.service_account(filename="credentials.json")
-        
-    source_sheet = client.open_by_url(STOCK_LIST_URL).worksheet("Sheet1")
-    dest_sheet   = client.open_by_url(NEW_MV2_URL).worksheet("Sheet5")
-    data_rows = source_sheet.get_all_values()[1:]
-    print(f"✅ Connected. Processing {END_INDEX-START_INDEX+1} symbols")
-except Exception as e:
-    print(f"❌ Connection Error: {e}")
-    raise
-
-current_date = date.today().strftime("%m/%d/%Y")
-CHROME_SERVICE = Service(ChromeDriverManager().install())
-
-# ---------------- ALL 14 VALUES SCRAPER ---------------- #
-def scrape_tradingview(url, symbol_name):
-    if not url:
-        print(f"  ❌ No URL for {symbol_name}")
-        return [""] * 14  # 14 empty values
-    
+def get_driver():
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option('useAutomationExtension', False)
-    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if os.path.exists(chrome_bin): opts.binary_location = chrome_bin
+    d = webdriver.Chrome(options=opts)
+    return d
+
+def process_row(task):
+    global processed_count, db_ok, db_fail, skipped_no_date
+    idx, row = task
+    row_clean = {str(k).strip(): v for k, v in row.items()}
+    symbol = str(row_clean.get('symbol', '')).strip()
+    day_url = str(row_clean.get(DAY_URL_COLUMN_NAME, '')).strip()
     
-    driver = webdriver.Chrome(service=CHROME_SERVICE, options=opts)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
+    # ✅ Only proceed if symbol has a valid date
+    target_date = DATE_MAP.get(symbol.upper())
+
+    if not target_date:
+        with progress_lock: skipped_no_date += 1
+        write_checkpoint(idx)
+        return
+
+    if "tradingview.com" not in day_url:
+        write_checkpoint(idx)
+        return
+
+    if not hasattr(thread_local, "counter"): thread_local.counter = 0
+
     try:
-        print(f"  🌐 {symbol_name[:20]}...")
+        if not hasattr(thread_local, "driver") or thread_local.driver is None or thread_local.counter >= BROWSER_RESTART_LIMIT:
+            if hasattr(thread_local, "driver") and thread_local.driver:
+                try: thread_local.driver.quit()
+                except: pass
+            thread_local.driver = get_driver()
+            thread_local.counter = 0
+            with drivers_lock: all_drivers.append(thread_local.driver)
+            thread_local.driver.get("https://www.tradingview.com/")
+            for c in json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]")):
+                try: thread_local.driver.add_cookie(c)
+                except: pass
+            thread_local.driver.refresh()
+
+        d = thread_local.driver
+        thread_local.counter += 1
+        d.get(day_url)
         
-        # Cookies
-        if os.path.exists("cookies.json"):
-            driver.get("https://www.tradingview.com/")
-            with open("cookies.json", "r") as f:
-                cookies = json.load(f)
-                for c in cookies[:15]:
-                    try:
-                        driver.add_cookie({
-                            "name": c.get("name"), "value": c.get("value"),
-                            "domain": c.get("domain", ".tradingview.com"), 
-                            "path": c.get("path", "/")
-                        })
-                    except: pass
-            driver.refresh()
-            time.sleep(4)
+        wait = WebDriverWait(d, 35)
+        chart = wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]")))
         
-        driver.set_page_load_timeout(60)
-        driver.get(url)
-        time.sleep(6)  # Full JS render
+        # Navigate to Date
+        ActionChains(d).move_to_element(chart).click().perform()
+        time.sleep(1)
+        ActionChains(d).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
         
-        # **ALL 14 VALUES - MULTIPLE STRATEGIES**
-        all_values = []
+        box = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[contains(@class,'input')]")))
+        box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
+        box.send_keys(target_date, Keys.ENTER)
         
-        # Strategy 1: Primary value classes (grab ALL)
-        selectors = [
-            ".valueValue-l31H9iuA.apply-common-tooltip",
-            ".valueValue-l31H9iuA",
-            "div[class*='valueValue']",
-            "div[class*='value']",
-            ".chart-markup-table .value",
-            "[data-value]"
-        ]
+        time.sleep(9) # Extra wait for all indicators to render
         
-        for selector in selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    values = []
-                    for el in elements[:20]:  # Grab up to 20
-                        text = el.text.strip().replace('−', '-').replace('∅', '')
-                        if text and len(text) < 25:  # Valid value
-                            values.append(text)
-                    all_values.extend(values)
-                    print(f"  ✅ Selector '{selector}': {len(values)} values")
-            except:
-                continue
+        # UI Cleanup
+        d.execute_script("document.querySelectorAll('.overlap-manager-root, .tv-dialog__close, [role=\"dialog\"], .tv-toast').forEach(el => el.remove());")
         
-        # Strategy 2: Numeric text extraction
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        numeric_divs = soup.find_all('div', string=re.compile(r'[\d,.-]+'))
-        for div in numeric_divs[:15]:
-            text = div.get_text().strip().replace('−', '-')
-            if re.match(r'^[\d,.-]+.*|.*[\d,.-]+$', text) and len(text) < 25:
-                if text not in all_values:
-                    all_values.append(text)
-        
-        # Strategy 3: Table cells
-        tables = soup.find_all('table')
-        for table in tables[:3]:
-            for cell in table.find_all(['td', 'th'])[:20]:
-                text = cell.get_text().strip().replace('−', '-')
-                if re.match(r'[\d,.-]', text) and len(text) < 25 and text not in all_values:
-                    all_values.append(text)
-        
-        # Deduplicate + Clean
-        unique_values = []
-        for val in all_values:
-            if val and len(val) > 0 and len(val) < 30 and val not in unique_values:
-                unique_values.append(val)
-        
-        # Pad to exactly 14 columns
-        final_values = unique_values[:14]
-        while len(final_values) < 14:
-            final_values.append("N/A")
-        
-        print(f"  📊 {len(unique_values)} unique → {final_values[:3]}...")
-        return final_values
-        
-    except TimeoutException:
-        print(f"  ⏰ Timeout")
-        return ["N/A"] * 14
+        img = chart.screenshot_as_png
+        month = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
+
+        if save_to_mysql(symbol, "day", img, target_date, month):
+            with progress_lock: 
+                db_ok += 1
+                processed_count += 1
+            log(f"✅ [{processed_count}] Saved {symbol} for {target_date}")
+        else:
+            with progress_lock: db_fail += 1
+            
+        write_checkpoint(idx)
+
     except Exception as e:
-        print(f"  ❌ Error: {e}")
-        return ["N/A"] * 14
+        log(f"🔥 Error {symbol}: {str(e)[:100]}")
+        try: thread_local.driver.quit()
+        except: pass
+        thread_local.driver = None
+        write_checkpoint(idx)
+
+def main():
+    if not init_db_pool(): return
+    try:
+        creds = json.loads(os.getenv("GSPREAD_CREDENTIALS"))
+        gc = gspread.service_account_from_dict(creds)
+        load_date_map(gc)
+
+        ws = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
+        all_rows = ws.get_all_records()
+        
+        start = read_checkpoint() + 1
+        # ✅ Filter tasks that actually have a date in the map
+        tasks = []
+        for i, r in enumerate(all_rows):
+            if i >= start:
+                sym = str(r.get('symbol', '')).strip().upper()
+                if sym in DATE_MAP:
+                    if (i % SHARD_STEP) == SHARD_INDEX:
+                        tasks.append((i, r))
+
+        log(f"🚀 Processing {len(tasks)} symbols with valid dates (Resuming from {start})")
+        
+        # ✅ FORCED EXECUTION: list() ensures the map is fully iterated
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            list(executor.map(process_row, tasks))
+
+    except Exception as e:
+        log(f"❌ Fatal: {e}")
     finally:
-        driver.quit()
+        with drivers_lock:
+            for d in all_drivers:
+                try: d.quit()
+                except: pass
+        log(f"📊 Final Stats: Success={db_ok}, Fail={db_fail}, Skipped(No Date)={skipped_no_date}")
 
-# ---------------- MAIN LOOP ---------------- #
-batch = []
-batch_start = None
-processed = success_count = 0
-
-print(f"\n🚀 Scraping {END_INDEX-START_INDEX+1} symbols → 14 columns each")
-
-for i, row in enumerate(data_rows):
-    if i < last_i or i < START_INDEX or i > END_INDEX:
-        continue
-    
-    name = row[0].strip()
-    url = row[3] if len(row) > 3 else ""
-    target_row = i + 2
-    
-    if batch_start is None:
-        batch_start = target_row
-    
-    print(f"[{i+1:4d}/{END_INDEX-START_INDEX+1}] {name[:25]} -> Row {target_row}")
-    
-    # Get ALL 14 values
-    vals = scrape_tradingview(url, name)
-    row_data = [name, current_date] + vals  # ALL 14 columns!
-    
-    if any(v != "N/A" for v in vals):
-        success_count += 1
-    
-    batch.append(row_data)
-    processed += 1
-    
-    # Batch write (5 rows × 16 columns)
-    if len(batch) >= 5:
-        try:
-            dest_sheet.update(f"A{batch_start}", batch)
-            print(f"💾 Rows {batch_start}-{target_row} (5×16 cols)")
-            batch = []
-            batch_start = None
-            time.sleep(2)
-        except Exception as e:
-            print(f"❌ Write error: {e}")
-    
-    # Checkpoint
-    with open(CHECKPOINT_FILE, "w") as f:
-        f.write(str(i + 1))
-    
-    time.sleep(1.8)
-
-# Final batch
-if batch and batch_start:
-    try:
-        dest_sheet.update(f"A{batch_start}", batch)
-        print(f"💾 Final: Rows {batch_start}-{target_row}")
-    except Exception as e:
-        print(f"❌ Final write: {e}")
-
-print(f"\n🎉 COMPLETE!")
-print(f"📊 Processed: {processed} | Success: {success_count}")
-print(f"📍 Sheet5: Rows {START_INDEX+2}-{END_INDEX+2} × 16 columns")
-print(f"✅ Success rate: {success_count/processed*100:.1f}%")
+if __name__ == "__main__":
+    main()
