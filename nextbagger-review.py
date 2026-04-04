@@ -1,4 +1,4 @@
-import os, time, json, gspread, concurrent.futures, re, socket, hashlib
+import os, time, json, gspread, concurrent.futures, re, hashlib
 import pandas as pd
 import mysql.connector
 from mysql.connector import pooling
@@ -15,247 +15,238 @@ import threading
 # ---------------- CONFIG ---------------- #
 SPREADSHEET_NAME = "Stock List"
 TAB_NAME = "Weekday"
-DAY_URL_COLUMN_NAME = "Day" 
 
-# ✅ Date Source Config
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
 DATE_TAB_NAME = "Sheet2"
-DATE_COL_LETTER = "CD"
-DATE_SYMBOL_COL = "A"
 
-# ✅ Target Table
+DATE_SYMBOL_COL = "A"
+DATE_COL_LETTER = "CD"
+
 TARGET_TABLE = "next_bagger_review_screenshot"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
-SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
-CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "checkpoint_nextbagger.txt")
-
-progress_lock = threading.Lock()
-processed_count = 0
-db_ok = 0
-db_fail = 0
-
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME"),
-    "port": int(os.getenv("DB_PORT", "3306")),
-    "connect_timeout": 20,
-}
 
 db_pool = None
 thread_local = threading.local()
-drivers_lock = threading.Lock()
-all_drivers = []
 DATE_MAP = {}
 
 # ---------------- HELPERS ---------------- #
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def col_letter_to_index(letter: str) -> int:
-    letter = letter.strip().upper()
+def col_letter_to_index(letter):
     n = 0
-    for ch in letter:
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - ord("A") + 1)
+    for ch in letter.upper():
+        n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
-def normalize_date(val: str) -> str:
+def normalize_date(val):
     if not val: return ""
-    s = re.sub(r"[^\d/\-]", "", str(val).strip())
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
-        try: return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except: pass
+    s = re.sub(r"[^\d/\-]", "", str(val))
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except:
+            pass
     return ""
 
-def write_checkpoint(i):
-    try:
-        with open(CHECKPOINT_FILE, "w") as f: f.write(str(i))
-    except: pass
-
-def read_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        try: 
-            with open(CHECKPOINT_FILE, "r") as f:
-                return int(f.read().strip())
-        except: return -1
-    return -1
-
-# ---------------- CORE LOGIC ---------------- #
+# ---------------- DATE MAP ---------------- #
 def load_date_map(gc):
     global DATE_MAP
-    DATE_MAP = {}
-    ss = gc.open(DATE_SPREADSHEET_NAME)
-    ws = ss.worksheet(DATE_TAB_NAME)
-    values = ws.get_all_values()
+
     sym_i = col_letter_to_index(DATE_SYMBOL_COL)
     date_i = col_letter_to_index(DATE_COL_LETTER)
+
+    values = gc.open(DATE_SPREADSHEET_NAME).worksheet(DATE_TAB_NAME).get_all_values()
 
     for r in values:
         if len(r) > max(sym_i, date_i):
             sym = str(r[sym_i]).strip().upper()
             dt = normalize_date(r[date_i])
-            if sym and dt: DATE_MAP[sym] = dt
-    log(f"✅ DATE_MAP: Loaded {len(DATE_MAP)} symbols from {DATE_TAB_NAME}")
+            if sym and dt:
+                DATE_MAP[sym] = dt
 
+    log(f"✅ DATE_MAP Loaded: {len(DATE_MAP)} symbols")
+
+# ---------------- DB ---------------- #
 def init_db_pool():
     global db_pool
-    try:
-        db_pool = mysql.connector.pooling.MySQLConnectionPool(
-            pool_name="screenshot_pool", pool_size=MAX_THREADS + 2, **DB_CONFIG
-        )
-        return True
-    except Exception as e:
-        log(f"❌ DB Pool Error: {e}")
-        return False
+    db_pool = mysql.connector.pooling.MySQLConnectionPool(
+        pool_name="pool",
+        pool_size=max(2, MAX_THREADS),
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        port=int(os.getenv("DB_PORT", "3306"))
+    )
 
-def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
-    if db_pool is None: return False
+def save_to_mysql(symbol, image, date):
     try:
         conn = db_pool.get_connection()
         cursor = conn.cursor()
-        query = f"""
-            INSERT INTO {TARGET_TABLE} (symbol, timeframe, screenshot, chart_date, month_before)
-            VALUES (%s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                screenshot = VALUES(screenshot),
-                chart_date = VALUES(chart_date),
-                month_before = VALUES(month_before),
-                created_at = CURRENT_TIMESTAMP
-        """
-        cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
+
+        cursor.execute(f"""
+            INSERT INTO {TARGET_TABLE} (symbol, screenshot, chart_date)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE screenshot=VALUES(screenshot)
+        """, (symbol, image, date))
+
         conn.commit()
         cursor.close()
         conn.close()
-        return True
-    except Exception as err:
-        log(f"    ❌ DB ERROR [{symbol}]: {err}")
-        return False
 
-# ---------------- BROWSER & WORKER ---------------- #
+    except Exception as e:
+        log(f"DB Error: {e}")
+
+# ---------------- BROWSER ---------------- #
 def get_driver():
     opts = Options()
+
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+    if not os.path.exists(chrome_bin):
+        chrome_bin = "/usr/bin/chromium"
+
+    opts.binary_location = chrome_bin
+
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    
-    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
-    if os.path.exists(chrome_bin):
-        opts.binary_location = chrome_bin
-        
-    d = webdriver.Chrome(options=opts)
-    d.set_page_load_timeout(60)
-    return d
 
+    return webdriver.Chrome(options=opts)
+
+def ensure_logged_in():
+    if not hasattr(thread_local, "driver"):
+        d = get_driver()
+        thread_local.driver = d
+
+        d.get("https://www.tradingview.com/chart/")
+        cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
+
+        for c in cookies:
+            d.add_cookie({
+                "name": c["name"],
+                "value": c["value"],
+                "domain": ".tradingview.com",
+                "path": "/"
+            })
+
+        d.refresh()
+
+    return thread_local.driver
+
+# ---------------- SMART WAIT ---------------- #
+def wait_for_chart_loaded(driver, timeout=20):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            loading = driver.execute_script("""
+                return document.querySelector('.is-loading') !== null;
+            """)
+            value_present = driver.execute_script("""
+                return document.querySelector('[data-name="legend-series-item"] .value-item') !== null;
+            """)
+
+            if not loading and value_present:
+                return True
+        except:
+            pass
+        time.sleep(0.5)
+    return False
+
+def wait_for_chart_stable(chart_el, timeout=6):
+    last_hash = None
+    stable_count = 0
+    end = time.time() + timeout
+
+    while time.time() < end:
+        current_hash = hashlib.md5(chart_el.screenshot_as_png).hexdigest()
+
+        if current_hash == last_hash:
+            stable_count += 1
+            if stable_count >= 3:
+                return True
+        else:
+            stable_count = 0
+            last_hash = current_hash
+
+        time.sleep(0.5)
+
+    return True
+
+# ---------------- WORKER ---------------- #
 def process_row(task):
-    global processed_count, db_ok, db_fail
     i, row = task
-    row_clean = {str(k).strip(): v for k, v in row.items()}
-    symbol = str(row_clean.get('symbol', '')).strip()
-    day_url = str(row_clean.get(DAY_URL_COLUMN_NAME, '')).strip()
+    values = list(row.values())
 
-    target_date = DATE_MAP.get(symbol.upper(), "")
-    if not target_date or "tradingview.com" not in day_url:
-        write_checkpoint(i)
+    if len(values) < 4:
+        return
+
+    symbol = str(values[0]).strip()
+    day_url = str(values[3]).strip()
+
+    target_date = DATE_MAP.get(symbol.upper())
+
+    log(f"➡ {symbol} | {target_date}")
+
+    if not symbol or not day_url or not target_date:
         return
 
     try:
-        if not hasattr(thread_local, "driver") or thread_local.driver is None:
-            log(f"🌐 Initializing Driver for Thread...")
-            thread_local.driver = get_driver()
-            with drivers_lock: all_drivers.append(thread_local.driver)
-            thread_local.driver.get("https://www.tradingview.com/")
-            cookies = json.loads(os.getenv("TRADINGVIEW_COOKIES", "[]"))
-            for c in cookies: 
-                try: thread_local.driver.add_cookie(c)
-                except: pass
-            thread_local.driver.refresh()
+        driver = ensure_logged_in()
 
-        d = thread_local.driver
-        d.get(day_url)
-        
-        wait = WebDriverWait(d, 30)
-        chart = wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]")))
-        
-        # Open 'Go To' Dialog
-        ActionChains(d).move_to_element(chart).click().perform()
-        time.sleep(1)
-        ActionChains(d).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
-        
-        # Enter Date
-        box = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[contains(@class,'input')]")))
-        box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
+        log(f"🌐 Opening chart {symbol}")
+        driver.get(day_url)
+
+        chart = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
+        )
+
+        log(f"📅 Setting date {target_date} for {symbol}")
+        ActionChains(driver).move_to_element(chart).click().perform()
+        ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
+
+        box = WebDriverWait(driver, 10).until(
+            EC.visibility_of_element_located((By.XPATH, "//input"))
+        )
         box.send_keys(target_date, Keys.ENTER)
-        
-        # Wait for data to render
-        time.sleep(6) 
-        
-        # Force a quick check for popups/ads that might block screenshot
-        try:
-            d.execute_script("document.querySelectorAll('.overlap-manager-root, .tv-dialog__close').forEach(el => el.remove());")
-        except: pass
 
+        log(f"⏳ Waiting for data load {symbol}")
+        wait_for_chart_loaded(driver)
+
+        log(f"🎯 Waiting for stable chart {symbol}")
+        wait_for_chart_stable(chart)
+
+        log(f"📸 Taking screenshot {symbol}")
         img = chart.screenshot_as_png
-        month_val = datetime.strptime(target_date, "%Y-%m-%d").strftime('%B')
 
-        if save_to_mysql(symbol, "day", img, target_date, month_val):
-            with progress_lock: 
-                db_ok += 1
-                processed_count += 1
-            log(f"✅ [{processed_count}] Saved {symbol} ({target_date})")
-        else:
-            with progress_lock: db_fail += 1
-            
-        write_checkpoint(i)
+        save_to_mysql(symbol, img, target_date)
+
+        log(f"✅ Captured {symbol}")
 
     except Exception as e:
-        log(f"🔥 Error row#{i} {symbol}: {str(e)[:150]}")
-        # If driver crashes, clear it so next task restarts it
-        try: thread_local.driver.quit()
-        except: pass
-        thread_local.driver = None
-        write_checkpoint(i)
+        log(f"❌ Error {symbol}: {e}")
 
+# ---------------- MAIN ---------------- #
 def main():
-    if not init_db_pool(): return
-    try:
-        creds_json = os.getenv("GSPREAD_CREDENTIALS")
-        creds = json.loads(creds_json)
-        gc = gspread.service_account_from_dict(creds)
-        load_date_map(gc)
+    init_db_pool()
 
-        ws = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
-        all_rows = ws.get_all_records()
-        
-        last_idx = read_checkpoint()
-        start_idx = last_idx + 1
-        
-        # Filter for shard and progress
-        tasks = []
-        for idx, r in enumerate(all_rows):
-            if idx >= start_idx:
-                if (idx % SHARD_STEP) == SHARD_INDEX:
-                    tasks.append((idx, r))
+    gc = gspread.service_account_from_dict(json.loads(os.getenv("GSPREAD_CREDENTIALS")))
 
-        log(f"🚀 Processing {len(tasks)} symbols (Resuming from {start_idx})")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            executor.map(process_row, tasks)
+    load_date_map(gc)
 
-    except Exception as e:
-        log(f"❌ Fatal Error: {e}")
-    finally:
-        with drivers_lock:
-            for d in all_drivers: 
-                try: d.quit()
-                except: pass
-        log(f"📊 Final Stats: Success={db_ok}, Fail={db_fail}")
-        log("🏁 Done.")
+    worksheet = gc.open(SPREADSHEET_NAME).worksheet(TAB_NAME)
+    values = worksheet.get_all_values()
+
+    rows = pd.DataFrame(values[1:], columns=values[0]).to_dict("records")
+
+    tasks = list(enumerate(rows))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        executor.map(process_row, tasks)
+
+    log("🏁 Done.")
 
 if __name__ == "__main__":
     main()
