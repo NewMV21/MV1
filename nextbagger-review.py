@@ -19,7 +19,7 @@ DAY_URL_COLUMN_NAME = "Day"  # ✅ Updated to your new column name
 
 # ✅ Date Source Config (Updated to sheet2 and Col CD)
 DATE_SPREADSHEET_NAME = "MV2 for SQL"
-DATE_TAB_NAME = "sheet2"
+DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
