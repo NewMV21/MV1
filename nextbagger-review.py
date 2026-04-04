@@ -161,43 +161,51 @@ def process_row(task):
             EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]"))
         )
 
-        # Focus chart
         ActionChains(driver).move_to_element(chart).click().perform()
 
-        # Open date dialog
         ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
 
-        # Enter date
         box = WebDriverWait(driver, 15).until(
             EC.visibility_of_element_located((By.XPATH, "//input"))
         )
         box.clear()
         box.send_keys(target_date, Keys.ENTER)
 
-        # ---------------- SMART WAIT START ---------------- #
+        # ---------------- ULTRA SMART WAIT ---------------- #
 
-        # Wait loader disappear (if exists)
         try:
-            WebDriverWait(driver, 15).until_not(
+            WebDriverWait(driver, 20).until_not(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'loading')]"))
             )
         except:
             pass
 
-        # Wait canvas (chart rendering)
-        WebDriverWait(driver, 20).until(
+        canvas = WebDriverWait(driver, 25).until(
             EC.presence_of_element_located((By.XPATH, "//canvas"))
         )
 
-        # Ensure chart is visible & stable
+        def canvas_is_rendered(driver):
+            try:
+                return driver.execute_script("""
+                    const canvas = document.querySelector('canvas');
+                    if (!canvas) return false;
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) return false;
+                    const pixel = ctx.getImageData(10, 10, 1, 1).data;
+                    return pixel[0] !== 0 || pixel[1] !== 0 || pixel[2] !== 0;
+                """)
+            except:
+                return False
+
+        WebDriverWait(driver, 25).until(canvas_is_rendered)
+
         WebDriverWait(driver, 20).until(
-            lambda d: chart.is_displayed() and chart.size['width'] > 0
+            lambda d: chart.is_displayed() and chart.size['width'] > 300
         )
 
-        # Final buffer for candle render
-        time.sleep(6)
+        time.sleep(2)
 
-        # ---------------- SMART WAIT END ---------------- #
+        # ---------------- END ---------------- #
 
         img = chart.screenshot_as_png
         save_to_mysql(symbol, img, target_date)
@@ -228,4 +236,4 @@ def main():
     log("🏁 Done.")
 
 if __name__ == "__main__":
-    main()
+    main() 
