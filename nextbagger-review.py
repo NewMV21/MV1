@@ -190,14 +190,34 @@ def wait_chart_ready(driver, timeout=25):
     return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]")))
 
 def force_clear_ads(driver):
+    """Aggressively removes overlays, dialogs, and specifically the blur layer."""
     try:
-        # Removes common overlays, menus, and the "Go to" dialog if it gets stuck
-        driver.execute_script("""
-            document.querySelectorAll("div[class*='overlap-manager'], [role='dialog'], div[class*='dialog'], .tv-dialog__modal-body").forEach(el => el.remove());
-        """)
+        script = """
+        const selectors = [
+            "div[class*='overlap-manager']", 
+            "[role='dialog']", 
+            "div[class*='dialog']", 
+            ".tv-dialog__modal-body",
+            "div[class*='backdrop']",
+            "div[class*='mask']",
+            "div[class*='overlay']"
+        ];
+        selectors.forEach(s => {
+            document.querySelectorAll(s).forEach(el => el.remove());
+        });
+        // Remove blur from body or main containers if injected via style
+        document.body.style.filter = 'none';
+        document.querySelectorAll('div').forEach(el => {
+            if(getComputedStyle(el).backdropFilter !== 'none') {
+                el.style.backdropFilter = 'none';
+                el.style.filter = 'none';
+            }
+        });
+        """
+        driver.execute_script(script)
     except: pass
 
-def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=8.0):
+def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=10.0):
     end = time.time() + max_wait
     last_h = None
     stable_hits = 0
@@ -212,16 +232,16 @@ def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=8.0):
                 stable_hits = 0
                 last_h = h
         except: return False
-        time.sleep(0.5)
+        time.sleep(0.6)
     return True
 
 def force_timeframe(driver, tf_key):
     try:
         actions = ActionChains(driver)
         actions.send_keys(tf_key).perform()
-        time.sleep(0.8)
+        time.sleep(1.0)
         actions.send_keys(Keys.ENTER).perform()
-        time.sleep(2.0)
+        time.sleep(2.5)
     except: pass
 
 def goto_date_fast(driver, chart_el, target_date):
@@ -237,12 +257,11 @@ def goto_date_fast(driver, chart_el, target_date):
     time.sleep(0.5)
     box.send_keys(Keys.ENTER)
     
-    # Wait for the Go-To box to actually vanish
     try:
-        WebDriverWait(driver, 5).until(EC.invisibility_of_element_located((By.XPATH, input_xpath)))
+        WebDriverWait(driver, 6).until(EC.invisibility_of_element_located((By.XPATH, input_xpath)))
     except:
         force_clear_ads(driver)
-    time.sleep(1.5)
+    time.sleep(2.0)
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
@@ -274,7 +293,7 @@ def process_row(task):
         ]
 
         for tf_label, tf_url, tf_key in timeframe_tasks:
-            log(f"🚀 ROW#{i} | {symbol} | Navigating to {tf_label.upper()}")
+            log(f"🚀 ROW#{i} | {symbol} | {tf_label.upper()}")
             driver.get(tf_url)
             
             chart = wait_chart_ready(driver)
@@ -282,17 +301,19 @@ def process_row(task):
 
             # Extra buffer for the Week timeframe
             if tf_label == "week":
-                time.sleep(1.0) 
+                time.sleep(1.5) 
 
             force_timeframe(driver, tf_key)
             goto_date_fast(driver, chart, target_date)
             
-            # Post-navigation cleanup
+            # Post-navigation cleanup to remove blur layers
             force_clear_ads(driver)
             
-            # Final 1s extra delay for week to ensure dialogs are cleared
+            # Additional 1s extra delay for week as requested
             if tf_label == "week":
+                log(f"  ⏳ Extra stability wait for WEEK...")
                 time.sleep(1.0)
+                force_clear_ads(driver) # Double check clear after extra wait
 
             wait_chart_stable_for_screenshot(driver, chart)
             img = chart.screenshot_as_png
