@@ -21,7 +21,7 @@ DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
-TARGET_TABLE = "next_bagger_review_screenshot"
+TARGET_TABLE = "next_bag_review_screenshot"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
@@ -164,7 +164,7 @@ def get_driver():
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080") # Increased window size
+    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     d = webdriver.Chrome(options=opts)
     d.set_page_load_timeout(45)
@@ -187,26 +187,14 @@ def ensure_thread_driver_logged_in():
 
 def wait_chart_ready(driver, timeout=25):
     WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
-    # Wait for the chart canvas to be present
     return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'chart-container')]")))
 
 def force_clear_ads(driver):
     try:
-        # Aggressive cleanup of dialogs, overlays, and sidebars that might block the screenshot
-        script = """
-        const selectors = [
-            "div[class*='overlap-manager']", 
-            "[role='dialog']", 
-            "div[class*='dialog']", 
-            ".tv-dialog__modal-body",
-            "div[class*='toast']",
-            "div[class*='notification']"
-        ];
-        selectors.forEach(s => {
-            document.querySelectorAll(s).forEach(el => el.remove());
-        });
-        """
-        driver.execute_script(script)
+        # Removes common overlays, menus, and the "Go to" dialog if it gets stuck
+        driver.execute_script("""
+            document.querySelectorAll("div[class*='overlap-manager'], [role='dialog'], div[class*='dialog'], .tv-dialog__modal-body").forEach(el => el.remove());
+        """)
     except: pass
 
 def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=8.0):
@@ -219,7 +207,7 @@ def wait_chart_stable_for_screenshot(driver, chart_el, max_wait=8.0):
             h = hashlib.md5(png).hexdigest()
             if h == last_h:
                 stable_hits += 1
-                if stable_hits >= 3: return True # Increased stability requirement
+                if stable_hits >= 3: return True
             else:
                 stable_hits = 0
                 last_h = h
@@ -233,33 +221,28 @@ def force_timeframe(driver, tf_key):
         actions.send_keys(tf_key).perform()
         time.sleep(0.8)
         actions.send_keys(Keys.ENTER).perform()
-        time.sleep(2.5) # Increased wait for candles to reload
+        time.sleep(2.0)
     except: pass
 
 def goto_date_fast(driver, chart_el, target_date):
-    # Ensure chart is focused
     ActionChains(driver).move_to_element(chart_el).click().perform()
     time.sleep(0.5)
-    
-    # Open "Go to" dialog
     ActionChains(driver).key_down(Keys.ALT).send_keys('g').key_up(Keys.ALT).perform()
     
     input_xpath = "//input[contains(@class,'query') or @data-role='search' or contains(@class,'input')]"
     box = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, input_xpath)))
-    
     box.send_keys(Keys.CONTROL, "a")
     box.send_keys(Keys.BACKSPACE)
     box.send_keys(target_date)
     time.sleep(0.5)
     box.send_keys(Keys.ENTER)
     
-    # CRITICAL: Wait for the dialog to actually disappear before moving on
+    # Wait for the Go-To box to actually vanish
     try:
         WebDriverWait(driver, 5).until(EC.invisibility_of_element_located((By.XPATH, input_xpath)))
     except:
         force_clear_ads(driver)
-    
-    time.sleep(2.0) # Buffer for chart jump
+    time.sleep(1.5)
 
 # ---------------- WORKER ---------------- #
 def process_row(task):
@@ -291,23 +274,27 @@ def process_row(task):
         ]
 
         for tf_label, tf_url, tf_key in timeframe_tasks:
-            log(f"🚀 ROW#{i} | {symbol} | {tf_label.upper()}")
+            log(f"🚀 ROW#{i} | {symbol} | Navigating to {tf_label.upper()}")
             driver.get(tf_url)
             
             chart = wait_chart_ready(driver)
             force_clear_ads(driver)
 
-            # 1. Force the timeframe
-            force_timeframe(driver, tf_key)
+            # Extra buffer for the Week timeframe
+            if tf_label == "week":
+                time.sleep(1.0) 
 
-            # 2. Go to the date
+            force_timeframe(driver, tf_key)
             goto_date_fast(driver, chart, target_date)
             
-            # 3. Final cleanup and stabilization
+            # Post-navigation cleanup
             force_clear_ads(driver)
-            wait_chart_stable_for_screenshot(driver, chart)
             
-            # Take screenshot
+            # Final 1s extra delay for week to ensure dialogs are cleared
+            if tf_label == "week":
+                time.sleep(1.0)
+
+            wait_chart_stable_for_screenshot(driver, chart)
             img = chart.screenshot_as_png
 
             # Save to DB
