@@ -21,7 +21,7 @@ DATE_TAB_NAME = "Sheet2"
 DATE_COL_LETTER = "CD"
 DATE_SYMBOL_COL = "A"
 
-TARGET_TABLE = "next_bag_review_screenshot"
+TARGET_TABLE = "next_bagger_review_screenshot"
 
 MAX_THREADS = int(os.getenv("MAX_THREADS", "2"))
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
