@@ -132,27 +132,32 @@ def init_db_pool():
         log(f"❌ POOL CONNECT FAILED: {repr(e)}")
         return False
 
-def save_to_mysql(symbol, timeframe, image_data, chart_date, month_val):
-    if db_pool is None: return False
+def save_to_mysql(symbol, timeframe, img, chart_date, month):
     try:
         conn = db_pool.get_connection()
         cursor = conn.cursor()
+
         query = f"""
-            INSERT INTO {TARGET_TABLE} (symbol, timeframe, screenshot, chart_date, month_before)
+            INSERT IGNORE INTO {TARGET_TABLE}
+            (symbol, timeframe, screenshot, chart_date, month_before)
             VALUES (%s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                screenshot = VALUES(screenshot),
-                chart_date = VALUES(chart_date),
-                month_before = VALUES(month_before),
-                created_at = CURRENT_TIMESTAMP
         """
-        cursor.execute(query, (symbol, timeframe, image_data, chart_date, month_val))
+
+        cursor.execute(query, (symbol, timeframe, img, chart_date, month))
         conn.commit()
+
+        inserted = cursor.rowcount  # 1 = inserted, 0 = skipped
+
         cursor.close()
         conn.close()
-        return True
-    except Exception as err:
-        log(f"    ❌ DB SAVE ERROR [{symbol} {timeframe}]: {repr(err)}")
+
+        if inserted == 0:
+            log(f"⏭️ SKIPPED (Already exists): {symbol} {timeframe}")
+
+        return inserted == 1
+
+    except Exception as e:
+        log(f"    ❌ DB Error {symbol}: {e}")
         return False
 
 # ---------------- BROWSER ---------------- #
