@@ -1,0 +1,37 @@
+name: Live Screen Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run every 1 hour
+    - cron: "0 * * * *"
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install selenium webdriver-manager mysql-connector-python gspread pandas
+      - name: Run Live Screen Script
+        env:
+          # Database Secrets
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          # Google & TradingView Secrets (Crucial for the new code)
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          TRADINGVIEW_COOKIES: ${{ secrets.TRADINGVIEW_COOKIES }}
+        run: |
+          python live.py
