@@ -3,9 +3,7 @@ name: Live Screen Bot
 on:
   workflow_dispatch:
 
-  schedule:
-    # Every hour at minute 5 (avoids GitHub's busiest :00 slot)
-    - cron: "5 * * * *"
+ 
 
 permissions:
   contents: read
