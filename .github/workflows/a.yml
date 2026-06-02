@@ -2,13 +2,22 @@ name: Live Screen Bot
 
 on:
   workflow_dispatch:
+
   schedule:
-    # Run every 1 hour
-    - cron: "0 * * * *"
+    # Every hour at minute 5 (avoids GitHub's busiest :00 slot)
+    - cron: "5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-screen-bot
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-22.04
+    timeout-minutes: 55
 
     steps:
       - name: Checkout Repository
@@ -20,17 +29,28 @@ jobs:
           python-version: "3.10"
           cache: "pip"
 
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
       - name: Install Dependencies
         run: |
-          pip install selenium webdriver-manager mysql-connector-python gspread pandas
+          pip install selenium
+          pip install webdriver-manager
+          pip install mysql-connector-python
+          pip install gspread
+          pip install pandas
+
+      - name: Verify Script Exists
+        run: |
+          ls -la
+          test -f live.py
+
       - name: Run Live Screen Script
         env:
-          # Database Secrets
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
-          # Google & TradingView Secrets (Crucial for the new code)
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
           TRADINGVIEW_COOKIES: ${{ secrets.TRADINGVIEW_COOKIES }}
         run: |
